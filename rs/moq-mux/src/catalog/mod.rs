@@ -33,6 +33,7 @@ pub(crate) mod interval;
 mod producer;
 mod select;
 mod stream;
+pub mod placement;
 mod timebase;
 pub(crate) mod tracks;
 
