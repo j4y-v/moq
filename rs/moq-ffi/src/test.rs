@@ -1436,6 +1436,54 @@ async fn catalog_now_fixes_the_clock_for_later_media() {
 	assert!(matches!(catalog.now(), Err(MoqError::Closed)));
 }
 
+/// A whole media frame stamped with the caller's own timestamp lands on the catalog clock at the
+/// instant it was written, whatever epoch the caller counts from, on a fresh catalog and on one
+/// whose clock was fixed earlier.
+#[tokio::test]
+#[ignore = "moq-dev/moq#9507: needs codec importers to shift their caller's timestamps through \
+            their Timebase"]
+async fn whole_media_frames_land_on_the_catalog_clock_when_written() {
+	for fixed in [false, true] {
+		let broadcast = MoqBroadcastProducer::new().unwrap();
+		if fixed {
+			MoqMediaCatalogProducer::new(broadcast.clone()).unwrap().now().unwrap();
+		}
+		let media = MoqMediaTrackProducer::audio(
+			&broadcast,
+			MoqMediaTarget::Named { name: None },
+			audio_init(MoqAudioFormat::opus(), opus_head()),
+		)
+		.unwrap();
+		let consumer = subscribe(&broadcast, "0.opus").await;
+		let before = kio::clock::wall();
+		media
+			.write_frame(MoqFrame {
+				payload: b"opus frame".to_vec(),
+				timestamp: us(0),
+			})
+			.unwrap();
+		let after = kio::clock::wall();
+		let frame = kio::clock::timeout(TIMEOUT, consumer.read_frame())
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+
+		let clock = broadcast.with_state(|state| Ok(state.catalog.clock())).unwrap();
+		let landed = clock
+			.wall_clock(moq_net::Timestamp::try_from(frame.timestamp).unwrap())
+			.unwrap();
+		// The clock maps whole microseconds, so the bounds widen by one.
+		let tick = Duration::from_micros(1);
+		assert!(
+			(before - tick..=after + tick).contains(&landed),
+			"fixed {fixed}: landed at {landed:?}, outside its write from {before:?} to {after:?}"
+		);
+		media.finish().unwrap();
+		broadcast.close().unwrap();
+	}
+}
+
 /// `next` yields every state in order with its timestamp; `latest` skips to the newest.
 #[tokio::test]
 async fn json_snapshot_roundtrip() {

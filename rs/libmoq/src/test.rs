@@ -4085,6 +4085,80 @@ fn double_close_all_resource_types() {
 	assert_eq!(moq_origin_close(origin), 0);
 }
 
+/// A media frame stamped with the caller's own timestamp lands on the catalog clock at the instant
+/// it was published, whatever epoch the caller counts from, on a fresh catalog and on one whose
+/// clock was fixed earlier.
+#[test]
+#[ignore = "moq-dev/moq#9507: needs codec importers to shift their caller's timestamps through \
+            their Timebase"]
+fn media_frames_land_on_the_catalog_clock_when_published() {
+	for fixed in [false, true] {
+		let origin = id(moq_origin_create());
+		let path = b"media-frames-land-on-the-catalog-clock";
+		let broadcast = publish_broadcast(origin, path);
+		if fixed {
+			catalog_now(broadcast);
+		}
+		let init = opus_head();
+		let media = id(publish_audio(
+			broadcast,
+			moq_audio_format::MOQ_AUDIO_FORMAT_OPUS,
+			&init,
+			None,
+		));
+
+		let consume = request_broadcast(origin, path);
+		let catalog_cb = Callback::new();
+		let catalog_task = id(unsafe { moq_consume_catalog(consume, 0, Some(channel_callback), catalog_cb.ptr) });
+		let catalog_id = id(catalog_cb.recv());
+		let frame_cb = Callback::new();
+		let track = id(unsafe { moq_consume_audio(catalog_id, 0, &TEN_SECONDS, Some(channel_callback), frame_cb.ptr) });
+
+		let before = kio::clock::wall();
+		let payload = b"opus frame";
+		assert_eq!(
+			unsafe { moq_publish_media_frame(media, payload.as_ptr(), payload.len(), micros(0)) },
+			0
+		);
+		let after = kio::clock::wall();
+		let frame_id = id(frame_cb.recv());
+		let mut frame = moq_frame {
+			payload: std::ptr::null(),
+			payload_size: 0,
+			timestamp: std::ptr::null(),
+			keyframe: false,
+		};
+		assert_eq!(unsafe { encoded_frame(frame_id, &mut frame) }, 0);
+		let pts = moq_net::Timestamp::try_from(read_timestamp(frame.timestamp)).unwrap();
+		assert_eq!(moq_consume_read_free(frame_id), 0);
+
+		let landed = State::lock()
+			.publish
+			.target(Id::try_from(broadcast).unwrap())
+			.unwrap()
+			.catalog
+			.clock()
+			.wall_clock(pts)
+			.unwrap();
+		// The clock maps whole microseconds, so the bounds widen by one.
+		let tick = Duration::from_micros(1);
+		assert!(
+			(before - tick..=after + tick).contains(&landed),
+			"fixed {fixed}: landed at {landed:?}, outside its publish from {before:?} to {after:?}"
+		);
+
+		assert_eq!(moq_consume_audio_cancel(track), 0);
+		assert_eq!(frame_cb.recv_terminal(), 0, "audio close delivers terminal 0");
+		assert_eq!(moq_consume_catalog_free(catalog_id), 0);
+		assert_eq!(moq_consume_catalog_cancel(catalog_task), 0);
+		assert_eq!(catalog_cb.recv_terminal(), 0, "catalog close delivers terminal 0");
+		assert_eq!(moq_consume_close(consume), 0);
+		assert_eq!(moq_publish_media_finish(media), 0);
+		assert_eq!(moq_publish_close(broadcast), 0);
+		assert_eq!(moq_origin_close(origin), 0);
+	}
+}
+
 /// Audio has no keyframes, so `moq_publish_media_cut` is the only thing that gives it group
 /// boundaries: without it every packet lands in one group that never closes. Cutting per packet is
 /// what a live publisher does, and `_seek` does the same with a chosen start.
