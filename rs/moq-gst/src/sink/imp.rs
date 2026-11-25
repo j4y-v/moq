@@ -445,9 +445,9 @@ impl ElementImpl for MoqSink {
 				return None;
 			}
 			if let Some(state) = control.live.as_ref()
-				&& let Some(catalog) = state.catalog.as_ref()
+				&& state.catalog.is_some()
 			{
-				pad.lifecycle().media.reserve(catalog, state.wall.clone(), &state.names);
+				pad.lifecycle().media.reserve(state.wall.clone(), &state.names);
 			}
 			control.admissions.insert(pad.clone());
 		}
@@ -610,7 +610,6 @@ impl MoqSink {
 			});
 			let pads = self.pads_locked(&control);
 			let state = control.live.as_ref().unwrap();
-			let catalog = state.catalog.as_ref().unwrap();
 			let wall = &state.wall;
 			pads.into_iter()
 				.map(|pad| {
@@ -619,7 +618,7 @@ impl MoqSink {
 						let changes = lifecycle.reset();
 						lifecycle.completion = Some(completion.clone());
 						if !lifecycle.is_released() {
-							lifecycle.media.reserve(catalog, wall.clone(), &state.names);
+							lifecycle.media.reserve(wall.clone(), &state.names);
 						}
 						changes
 					};
@@ -913,8 +912,8 @@ impl MoqSink {
 					let mut lifecycle = sink_pad.lifecycle();
 					if !lifecycle.is_released() {
 						lifecycle.phase = Phase::Streaming;
-						if let Some(catalog) = &state.catalog {
-							lifecycle.media.reserve(catalog, state.wall.clone(), &state.names);
+						if state.catalog.is_some() {
+							lifecycle.media.reserve(state.wall.clone(), &state.names);
 						}
 					}
 				}
@@ -939,8 +938,8 @@ impl MoqSink {
 									lifecycle.phase = Phase::Streaming;
 									lifecycle.media.flush();
 									let catalog = state.catalog.as_ref();
-									if let Some(catalog) = catalog {
-										lifecycle.media.reserve(catalog, state.wall.clone(), &state.names);
+									if catalog.is_some() {
+										lifecycle.media.reserve(state.wall.clone(), &state.names);
 									}
 									let caps = lifecycle.media.resumable_caps();
 									let changes = caps.zip(catalog).and_then(|(caps, catalog)| {
@@ -1299,7 +1298,7 @@ fn observe_caps(
 	lifecycle: &mut PadLifecycle,
 	caps: &gst::Caps,
 ) -> (Option<Notifications>, bool) {
-	lifecycle.media.reserve(catalog, state.wall.clone(), &state.names);
+	lifecycle.media.reserve(state.wall.clone(), &state.names);
 	let requested = lifecycle.requested().map(str::to_owned);
 	let mut options = ProducerOptions::new(caps).with_container(lifecycle.container().into());
 	if let Some(track) = requested.as_deref() {

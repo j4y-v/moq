@@ -48,6 +48,12 @@ impl Wall {
 		Ok(())
 	}
 
+	/// A reservation on the run's timebase, so every pad's buffers shift by the offset its first
+	/// buffer placed, onto the wall-clock time its running time says.
+	pub(super) fn reserve(&self) -> moq_mux::catalog::Reserved {
+		self.timebase.reserve()
+	}
+
 	/// A run without buffers still closes its catalog, without leaving a reservation outstanding.
 	pub(super) fn finish(&self) {
 		self.pending.lock().unwrap().take();

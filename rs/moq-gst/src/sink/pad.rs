@@ -354,20 +354,15 @@ impl Pad {
 	}
 
 	/// Fill a run's slot once, including a pad visible before its admission confirms.
-	pub(super) fn reserve(
-		&mut self,
-		catalog: &moq_mux::catalog::Producer,
-		wall: std::sync::Arc<super::wall::Wall>,
-		names: &Names,
-	) {
-		self.wall = Some(wall);
+	pub(super) fn reserve(&mut self, wall: std::sync::Arc<super::wall::Wall>, names: &Names) {
 		self.names = names.clone();
 		if let Producer::Idle { caps } = &mut self.producer {
 			self.producer = Producer::Reserved {
-				slot: Box::new(catalog.reserve()),
+				slot: Box::new(wall.reserve()),
 				caps: caps.take(),
 			};
 		}
+		self.wall = Some(wall);
 	}
 
 	/// The live producer's track, if any.
@@ -466,7 +461,9 @@ impl Pad {
 			// A live producer stays until the build finalizes it.
 			previous => {
 				self.producer = previous;
-				catalog.reserve()
+				self.wall
+					.as_ref()
+					.map_or_else(|| catalog.reserve(), |wall| wall.reserve())
 			}
 		};
 		let caps = options.caps.clone();
@@ -1576,7 +1573,7 @@ mod tests {
 		let names = Names::default();
 		let publish = || {
 			let mut pad = Pad::new();
-			pad.reserve(&catalog, super::super::wall::Wall::new(&catalog), &names);
+			pad.reserve(super::super::wall::Wall::new(&catalog), &names);
 			let outcome = pad.observe_caps(&broadcast, &catalog, producer_options(&opaque_caps(), Some("levels")));
 			assert!(pad.finalize().unwrap());
 			outcome
@@ -1595,7 +1592,7 @@ mod tests {
 		let names = Names::default();
 		let publish = |name| {
 			let mut pad = Pad::new();
-			pad.reserve(&catalog, super::super::wall::Wall::new(&catalog), &names);
+			pad.reserve(super::super::wall::Wall::new(&catalog), &names);
 			let outcome = pad.observe_caps(&broadcast, &catalog, producer_options(&opaque_caps(), Some(name)));
 			(pad, outcome)
 		};
