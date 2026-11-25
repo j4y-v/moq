@@ -14,6 +14,8 @@ use super::{Producer, Reserved};
 /// new init segment) stay in sync, while separate timebases each get their own.
 ///
 /// [`Producer::reserve`] mints a fresh timebase per call, which is what a lone importer wants.
+/// [`Producer::clocked`] mints one for frames already stamped from the catalog clock, which shifts
+/// them by zero.
 /// Clones share the offset. Holding one never withholds the catalog: only a live [`Reserved`]
 /// does.
 pub struct Timebase<E: CatalogExt = ()> {
@@ -27,6 +29,21 @@ impl<E: CatalogExt> Timebase<E> {
 			catalog,
 			offset: Default::default(),
 		}
+	}
+
+	/// A timebase whose timestamps are already on the catalog clock: it shifts them by zero and
+	/// never anchors, so a placement on it is refused. See [`Producer::clocked`].
+	pub(super) fn verbatim(catalog: Producer<E>) -> Self {
+		Self {
+			catalog,
+			offset: Arc::new(OnceLock::from(Offset::default())),
+		}
+	}
+
+	/// A timebase on the same catalog for timestamps this one already shifted: for an importer
+	/// handing them to the codec importers it reserves for (TS, FLV), which would shift them again.
+	pub(crate) fn shifted(&self) -> Self {
+		Self::verbatim(self.catalog.clone())
 	}
 
 	/// Begin reserving an importer's tracks, sharing this timebase's offset.

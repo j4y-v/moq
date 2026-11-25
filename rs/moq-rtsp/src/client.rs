@@ -1714,21 +1714,30 @@ mod tests {
 	}
 
 	/// A catalog whose clock was fixed before the pull, such as one shared by several cameras,
-	/// cannot be moved: the session keeps its timestamps.
+	/// cannot be moved, but the session's frames still land on it where they arrived.
 	#[tokio::test]
-	async fn a_clock_fixed_before_the_session_is_left_alone() {
+	async fn a_clock_fixed_before_the_session_lands_its_frames_at_arrival() {
+		kio::clock::host_time(); // real RTSP sockets stamp each frame's arrival on the host clock
 		let server = Server::bind(vec![Media::H265]).await;
 		let (broadcast, catalog, pull) = pull(client(server.url()).unwrap());
 		let _fixed = catalog.clock();
 
 		let mut session = within("PLAY", server.accept(0)).await;
+		let sent = wall_now();
 		session.video(0, 0, H265_KEYFRAME).await;
 		let snapshot = catalog_with(&catalog, 1, 0).await;
+		let published = wall_now();
 		let reader = subscribe(&broadcast, video_track(&snapshot)).await;
 		session.close().await;
 		assert_eq!(within("the pull", pull).await.unwrap().unwrap(), End::Closed);
 
-		assert_eq!(frames(reader).await[0].timestamp.as_micros().unwrap(), 0);
+		// It arrived after it was sent and before the catalog it placed went out; the clock maps
+		// whole microseconds, so the bounds widen by one.
+		let landed = wall_of(&snapshot, &frames(reader).await[0]);
+		assert!(
+			(sent - 1..=published + 1).contains(&landed),
+			"landed at {landed} µs, outside its arrival from {sent} to {published}"
+		);
 	}
 
 	/// Video held after a loss still has to see a keyframe in time, or the pull fails rather

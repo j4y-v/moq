@@ -1440,8 +1440,6 @@ async fn catalog_now_fixes_the_clock_for_later_media() {
 /// instant it was written, whatever epoch the caller counts from, on a fresh catalog and on one
 /// whose clock was fixed earlier.
 #[tokio::test]
-#[ignore = "moq-dev/moq#9507: needs codec importers to shift their caller's timestamps through \
-            their Timebase"]
 async fn whole_media_frames_land_on_the_catalog_clock_when_written() {
 	for fixed in [false, true] {
 		let broadcast = MoqBroadcastProducer::new().unwrap();
@@ -3808,7 +3806,7 @@ async fn dynamic_track_request_can_publish_media() {
 		.unwrap()
 		.expect("expected a frame");
 	assert_eq!(frame.payload, payload);
-	assert_eq!(micros(frame.timestamp), 20_000);
+	// The caller's timestamp shifts onto the catalog clock; whole_media_frames_land_on_the_catalog_clock_when_written covers where.
 
 	media.discontinuity().unwrap();
 	media.finish().unwrap();
@@ -4551,7 +4549,7 @@ async fn local_publish_consume_audio() {
 		.expect("expected a frame");
 
 	assert_eq!(frame.payload, payload);
-	assert_eq!(micros(frame.timestamp), 1_000_000);
+	// The caller's timestamp shifts onto the catalog clock; whole_media_frames_land_on_the_catalog_clock_when_written covers where.
 
 	broadcast.close().unwrap();
 }
@@ -4623,7 +4621,7 @@ async fn video_publish_consume() {
 		.unwrap()
 		.expect("expected frame");
 
-	assert_eq!(micros(frame.timestamp), 0);
+	// The caller's timestamp shifts onto the catalog clock; whole_media_frames_land_on_the_catalog_clock_when_written covers where.
 	assert!(!frame.payload.is_empty(), "frame should have payload data");
 
 	broadcast.close().unwrap();
@@ -5013,14 +5011,12 @@ async fn video_decode_start() {
 		}
 		timestamps
 	};
-	assert_eq!(
-		timestamps(oldest).await.first(),
-		Some(&0),
-		"the default starts at the oldest group"
-	);
+	// The timestamps shift onto the catalog clock by one offset: the oldest group lands where the
+	// first frame arrived, and the newest `NEWEST_US` after it.
+	let oldest = *timestamps(oldest).await.first().unwrap();
 	assert_eq!(
 		timestamps(latest).await.first(),
-		Some(&NEWEST_US),
+		Some(&(oldest + NEWEST_US)),
 		"latest joins at the newest group"
 	);
 	broadcast.close().unwrap();
@@ -5265,6 +5261,8 @@ async fn multiple_frames_ordering() {
 			.unwrap();
 	}
 
+	// The timestamps shift onto the catalog clock by one offset, keeping their spacing.
+	let mut base = None;
 	for (i, &expected_ts) in timestamps.iter().enumerate() {
 		let frame = kio::clock::timeout(TIMEOUT, next_encoded_frame(&media_consumer))
 			.await
@@ -5272,7 +5270,9 @@ async fn multiple_frames_ordering() {
 			.unwrap()
 			.unwrap_or_else(|| panic!("expected frame {i}"));
 
-		assert_eq!(micros(frame.timestamp), expected_ts, "frame {i} has wrong timestamp");
+		let at = micros(frame.timestamp);
+		let base = *base.get_or_insert(at - expected_ts);
+		assert_eq!(at, base + expected_ts, "frame {i} has wrong timestamp");
 		let expected = format!("frame-{i}");
 		assert_eq!(frame.payload, expected.as_bytes(), "frame {i} has wrong payload");
 	}
@@ -6499,7 +6499,7 @@ async fn server_client_run_end(version: &str) {
 		.unwrap()
 		.expect("expected a frame");
 	assert_eq!(frame.payload, payload);
-	assert_eq!(micros(frame.timestamp), 1_000_000);
+	// The caller's timestamp shifts onto the catalog clock; whole_media_frames_land_on_the_catalog_clock_when_written covers where.
 
 	media.finish().unwrap();
 	assert!(

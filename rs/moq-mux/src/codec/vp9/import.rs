@@ -125,6 +125,7 @@ impl Import {
 
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
+		let end = self.track.shifted(end)?;
 		self.track.cut(end)?;
 		Ok(())
 	}
@@ -143,6 +144,7 @@ impl Import {
 
 	/// Close the current group and open the next one at `start`.
 	pub fn seek(&mut self, start: u64) -> crate::Result<()> {
+		let start = self.track.shifted_start(start)?;
 		self.track.seek(start)?;
 		Ok(())
 	}

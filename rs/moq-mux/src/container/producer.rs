@@ -458,6 +458,22 @@ where
 		}
 	}
 
+	/// A caller's group `end`, shifted onto the catalog clock as [`timestamp`](Self::timestamp)
+	/// shifts its frames: for a codec importer's [`cut`](Self::cut).
+	pub(crate) fn shifted(&self, end: Option<moq_net::Timestamp>) -> crate::Result<Option<moq_net::Timestamp>> {
+		end.map(|end| self.timestamp(Some(end))).transpose()
+	}
+
+	/// A caller's group `start`, in the track's timescale, shifted likewise: for a codec importer's
+	/// [`seek`](Self::seek). A track without a timescale has no time to shift.
+	pub(crate) fn shifted_start(&self, start: u64) -> crate::Result<u64> {
+		let Some(scale) = self.inner.info().timescale else {
+			return Ok(start);
+		};
+		let start = moq_net::Timestamp::new(start, scale).map_err(|_| moq_net::Error::TimestampMismatch)?;
+		Ok(self.timestamp(Some(start))?.value())
+	}
+
 	fn publish_estimate(&mut self) -> crate::Result<()> {
 		let reading = self.estimator.reading();
 		if let Some(member) = self.member.as_mut() {

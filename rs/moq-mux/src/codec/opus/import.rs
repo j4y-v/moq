@@ -81,6 +81,7 @@ impl Import {
 
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
+		let end = self.track.shifted(end)?;
 		self.track.cut(end)?;
 		Ok(())
 	}
@@ -95,6 +96,7 @@ impl Import {
 
 	/// Close the current group and open the next one at `start`.
 	pub fn seek(&mut self, start: u64) -> crate::Result<()> {
+		let start = self.track.shifted_start(start)?;
 		self.track.seek(start)?;
 		Ok(())
 	}
@@ -204,7 +206,7 @@ mod tests {
 			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
 			.unwrap();
 		let subscriber = track.subscribe(None);
-		let reserved = catalog.reserve();
+		let reserved = catalog.clocked().reserve();
 		let config = crate::codec::opus::Config::new(48_000, 2);
 		let mut config: hang::catalog::AudioConfig = config.into();
 		config.container = hang::catalog::Container::Loc;
@@ -253,7 +255,7 @@ mod tests {
 			);
 		let config: hang::catalog::AudioConfig = crate::codec::opus::Config::new(48_000, 2).into();
 		let wire = crate::catalog::hang::Container::try_from(&config).unwrap();
-		let mut import = super::Import::new(track, catalog.reserve(), config).unwrap();
+		let mut import = super::Import::new(track, catalog.clocked().reserve(), config).unwrap();
 
 		// Two 20 ms CELT packets, then a pause.
 		for start in [0, 20_000] {
@@ -282,5 +284,126 @@ mod tests {
 		// The marker sits one unit of the track's timescale before the packet's end, so what resumes
 		// right there still starts after it.
 		assert_eq!(reads, ["frame 0", "frame 20000", "end 39999"]);
+	}
+
+	/// An Opus importer on `reserved`, publishing in LOC, and a reader of what it publishes.
+	fn loc_import(
+		broadcast: &mut moq_net::broadcast::Producer,
+		name: &str,
+		reserved: crate::catalog::Reserved,
+	) -> (
+		super::Import,
+		crate::container::Consumer<crate::catalog::hang::Container>,
+	) {
+		let track = broadcast
+			.create_track(name, hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
+		let subscriber = track.subscribe(None);
+		let mut config: hang::catalog::AudioConfig = crate::codec::opus::Config::new(48_000, 2).into();
+		config.container = hang::catalog::Container::Loc;
+		let import = super::Import::new(track, reserved, config).unwrap();
+		let media = crate::container::Consumer::new(
+			subscriber,
+			crate::catalog::hang::Container::Loc(crate::container::Kind::Data),
+		);
+		(import, media)
+	}
+
+	async fn read(media: &mut crate::container::Consumer<crate::catalog::hang::Container>) -> Timestamp {
+		kio::clock::timeout(Duration::from_secs(1), media.read_frame())
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap()
+			.timestamp
+	}
+
+	fn at(micros: u64) -> Option<Timestamp> {
+		Some(Timestamp::from_micros(micros).unwrap())
+	}
+
+	/// A caller's timestamps land on a clock fixed before the first frame at the frame's arrival,
+	/// keeping their spacing, rather than at the clock's zero.
+	#[tokio::test(start_paused = true)]
+	async fn a_caller_timestamp_lands_at_arrival_on_a_clock_fixed_earlier() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let clock = catalog.clock();
+		kio::clock::sleep(Duration::from_secs(3)).await;
+		let (mut import, mut media) = loc_import(&mut broadcast, "audio", catalog.reserve());
+
+		let arrival = clock.now();
+		import.decode(b"first", at(0)).unwrap();
+		import.decode(b"second", at(20_000)).unwrap();
+		assert_eq!(read(&mut media).await, arrival);
+		assert_eq!(
+			read(&mut media).await.as_micros().unwrap(),
+			arrival.as_micros().unwrap() + 20_000
+		);
+	}
+
+	/// The shift moves a frame's timestamp, never its delivery: a reader gets each frame as soon as
+	/// it is written, its timestamp shifted forward onto the clock or published as stamped. Time is
+	/// paused, so any wait for the clock would show as time passing.
+	#[tokio::test(start_paused = true)]
+	async fn a_shifted_frame_is_delivered_without_waiting() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let clock = catalog.clock();
+		kio::clock::sleep(Duration::from_secs(3)).await;
+		for (name, reserved, shifted) in [
+			("shifted", catalog.reserve(), true),
+			("clocked", catalog.clocked().reserve(), false),
+		] {
+			let (mut import, mut media) = loc_import(&mut broadcast, name, reserved);
+			let written = kio::clock::now();
+			import.decode(b"frame", at(0)).unwrap();
+			let timestamp = read(&mut media).await;
+			assert_eq!(kio::clock::now(), written, "{name}: delivered without waiting");
+			assert_eq!(timestamp == clock.now(), shifted, "{name}: shifted onto the clock");
+		}
+	}
+
+	/// Two sources sharing one catalog clock each land at their own first frame's arrival, however
+	/// far apart their own timestamps are.
+	#[tokio::test(start_paused = true)]
+	async fn two_sources_on_one_clock_each_land_at_arrival() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let clock = catalog.clock();
+		let (mut first, mut first_media) = loc_import(&mut broadcast, "first", catalog.reserve());
+		let (mut second, mut second_media) = loc_import(&mut broadcast, "second", catalog.reserve());
+
+		let first_arrival = clock.now();
+		first.decode(b"first", at(5_000_000)).unwrap();
+		kio::clock::sleep(Duration::from_secs(1)).await;
+		let second_arrival = clock.now();
+		second.decode(b"second", at(0)).unwrap();
+		assert_eq!(read(&mut first_media).await, first_arrival);
+		assert_eq!(read(&mut second_media).await, second_arrival);
+	}
+
+	/// A writer stamping from the catalog clock publishes its timestamps unshifted, however long it
+	/// took to encode the frame.
+	#[tokio::test(start_paused = true)]
+	async fn a_clocked_timebase_publishes_unshifted() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let timebase = catalog.clocked();
+		let (mut import, mut media) = loc_import(&mut broadcast, "audio", timebase.reserve());
+
+		let captured = catalog.clock().now();
+		kio::clock::sleep(Duration::from_millis(40)).await;
+		import.decode(b"late", Some(captured)).unwrap();
+		assert_eq!(read(&mut media).await, captured);
+		assert!(
+			timebase
+				.place(
+					Timestamp::ZERO,
+					kio::clock::Wall::UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+				)
+				.is_err(),
+			"a clocked timebase is never placed"
+		);
 	}
 }

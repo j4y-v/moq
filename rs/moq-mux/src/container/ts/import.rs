@@ -385,9 +385,10 @@ impl<E: catalog::Catalog> Import<E> {
 		health.hand_over(pid, &mut self.health, cadenced);
 	}
 
-	/// A reservation on this program's timebase, so every stream shifts by its offset.
+	/// A reservation for a stream's codec importer, which takes the timestamps this program's
+	/// timebase already shifted.
 	fn reserve(&self) -> crate::catalog::Reserved<E> {
-		self.timebase.reserve()
+		self.timebase.shifted().reserve()
 	}
 
 	/// The video hint for a decoded rendition: this importer's container, nothing else.
@@ -1037,7 +1038,7 @@ impl<E: catalog::Catalog> Import<E> {
 				format: (0, 0, 0),
 				broadcast: self.broadcast.clone(),
 				reserved: Some(self.reserve()),
-				timebase: self.timebase.clone(),
+				timebase: self.timebase.shifted(),
 				container: self.container.clone(),
 				tail: Vec::new(),
 				tail_pts: None,
@@ -1132,7 +1133,7 @@ impl<E: catalog::Catalog> Import<E> {
 			import: None,
 			broadcast: self.broadcast.clone(),
 			reserved: Some(self.reserve()),
-			timebase: self.timebase.clone(),
+			timebase: self.timebase.shifted(),
 			format: (0, 0),
 			container: self.container.clone(),
 			tail: Vec::new(),
@@ -3763,7 +3764,7 @@ struct AacStream<E: CatalogExt = ()> {
 	/// withheld until this deferred rendition resolves (config comes from the first ADTS header).
 	/// Consumed when `import` is built, or released by a frame that cannot build it.
 	reserved: Option<crate::catalog::Reserved<E>>,
-	/// Reserves the rendition anew on the program's timebase when `import` is built after `reserved`
+	/// Reserves the rendition anew, on the program's already shifted timestamps, when `import` is built after `reserved`
 	/// was released, or for the next track after a config change.
 	timebase: crate::catalog::Timebase<E>,
 	/// The container this importer publishes decoded renditions with.
@@ -4400,7 +4401,7 @@ struct LegacyStream<E: CatalogExt = ()> {
 	/// withheld until this deferred rendition resolves (config comes from the first frame header).
 	/// Consumed when `import` is built.
 	reserved: Option<crate::catalog::Reserved<E>>,
-	/// Reserves the next track on the program's timebase after a config change.
+	/// Reserves the next track, on the program's already shifted timestamps, after a config change.
 	timebase: crate::catalog::Timebase<E>,
 	/// The sample rate and channel count `import` was built with, from the first frame header.
 	format: (u32, u32),

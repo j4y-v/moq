@@ -528,9 +528,19 @@ impl<E: CatalogExt> Reserved<E> {
 			.media(track, container, rendition, config.into(), self.interval)
 	}
 
-	/// Resolve a timestamp on the broadcast's shared clock (see [`Producer::timestamp`]).
+	/// Resolve a timestamp on the broadcast's shared clock: `hint` shifted by this reservation's
+	/// [`Timebase`](super::Timebase), or the clock's reading now.
 	pub fn timestamp(&self, hint: Option<moq_net::Timestamp>) -> crate::Result<moq_net::Timestamp> {
-		self.timebase.catalog.timestamp(hint)
+		match hint {
+			Some(pts) => self.timebase.shift(pts),
+			None => self.timebase.catalog.timestamp(None),
+		}
+	}
+
+	/// A reservation on the same catalog whose timestamps are already shifted: for an importer
+	/// handing its own shifted timestamps to the codec importers it reserves for (TS, FLV).
+	pub(crate) fn verbatim(&self) -> Self {
+		Self::new(self.timebase.shifted()).with_interval(self.interval)
 	}
 
 	/// The underlying catalog [`Producer`], for edits that outlive this reservation.
@@ -578,6 +588,8 @@ impl<E: CatalogExt> Drop for Reserved<E> {
 /// catalog document and enforces nothing.
 pub(crate) struct Rendition<E: CatalogExt, C: RenditionConfig<E>> {
 	catalog: Producer<E>,
+	/// The timebase a caller's timestamps shift by, which a successor track keeps.
+	timebase: super::Timebase<E>,
 	name: String,
 	/// The reservation this rendition holds until its config is set (or it's dropped unfulfilled).
 	/// `Some` gates the initial publish; cleared by [`set`](Self::set).
@@ -611,25 +623,31 @@ impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 		interval: Option<std::time::Duration>,
 	) -> crate::Result<crate::container::Producer<super::hang::Container, C>> {
 		let track = self.catalog.fresh_track(&self.name, info);
-		let rendition = self.catalog.rendition(track.name())?;
+		let rendition = self.catalog.rendition(track.name(), self.timebase.clone())?;
 		self.catalog.media(track, container, rendition, None, interval)
 	}
 
 	fn new(reserved: Reserved<E>, name: String) -> crate::Result<Self> {
-		Self::owned(reserved.producer(), Some(reserved), name)
+		Self::owned(reserved.producer(), reserved.timebase(), Some(reserved), name)
 	}
 
-	pub(super) fn live(catalog: Producer<E>, name: String) -> crate::Result<Self> {
-		Self::owned(catalog, None, name)
+	pub(super) fn live(catalog: Producer<E>, name: String, timebase: super::Timebase<E>) -> crate::Result<Self> {
+		Self::owned(catalog, timebase, None, name)
 	}
 
-	fn owned(catalog: Producer<E>, gate: Option<Reserved<E>>, name: String) -> crate::Result<Self> {
+	fn owned(
+		catalog: Producer<E>,
+		timebase: super::Timebase<E>,
+		gate: Option<Reserved<E>>,
+		name: String,
+	) -> crate::Result<Self> {
 		// Take the name now, not at `set`: a lazily-configured importer (H.264 before its first SPS)
 		// has no catalog entry until much later, and the name has to be ours for that whole window.
 		catalog.acquire::<C>(&name)?;
 
 		Ok(Self {
 			catalog,
+			timebase,
 			gate,
 			name,
 			present: false,
@@ -655,9 +673,14 @@ impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 		self.catalog.current_clock()
 	}
 
-	/// Resolve a timestamp on the broadcast's shared clock (see [`Producer::timestamp`]).
+	/// Resolve a timestamp on the broadcast's shared clock: a caller's `hint` shifted by the
+	/// rendition's [`Timebase`](super::Timebase), anchoring it on its first, or the clock's
+	/// reading now.
 	pub fn timestamp(&self, hint: Option<moq_net::Timestamp>) -> crate::Result<moq_net::Timestamp> {
-		self.catalog.timestamp(hint)
+		match hint {
+			Some(pts) => self.timebase.shift(pts),
+			None => self.catalog.timestamp(None),
+		}
 	}
 
 	/// Validate and publish the rendition, fulfilling its reservation only after the edit succeeds.

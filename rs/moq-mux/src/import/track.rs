@@ -1060,7 +1060,7 @@ mod tests {
 		};
 		let mut import = Track::audio(
 			broadcast.reserve_track("audio").unwrap(),
-			catalog.reserve(),
+			catalog.clocked().reserve(),
 			AudioInit::new(AudioFormat::Flac, config.description()),
 		)
 		.unwrap();
@@ -1194,7 +1194,7 @@ mod tests {
 		let subscriber = track.subscribe(None);
 
 		let config = crate::codec::opus::Config::new(48_000, 2);
-		let mut import = crate::codec::opus::Import::new(track, catalog.reserve(), config.into()).unwrap();
+		let mut import = crate::codec::opus::Import::new(track, catalog.clocked().reserve(), config.into()).unwrap();
 		assert!(catalog.snapshot().audio.renditions.contains_key("audio"));
 
 		let mut media = crate::container::Consumer::new(
@@ -1567,7 +1567,12 @@ mod tests {
 		let (broadcast, catalog) = new_broadcast();
 		let consumer = broadcast.consume();
 		let request = broadcast.reserve_track("video").unwrap();
-		let mut import = Track::video(request, catalog.reserve(), VideoInit::new(VideoFormat::Hvc1, hvcc)).unwrap();
+		let mut import = Track::video(
+			request,
+			catalog.clocked().reserve(),
+			VideoInit::new(VideoFormat::Hvc1, hvcc),
+		)
+		.unwrap();
 
 		let track = consumer.track("video").unwrap().subscribe(None).await.unwrap();
 		let mut media = crate::container::Consumer::new(
@@ -1650,7 +1655,7 @@ mod tests {
 			let consumer = broadcast.consume();
 			let mut import = Track::video(
 				broadcast.reserve_track("video").unwrap(),
-				catalog.reserve(),
+				catalog.clocked().reserve(),
 				VideoInit::new(format, init.clone()),
 			)
 			.unwrap();
@@ -1865,7 +1870,7 @@ mod tests {
 			let (broadcast, catalog) = new_broadcast();
 			let consumer = broadcast.consume();
 			let request = broadcast.reserve_track("video").unwrap();
-			let mut import = Track::video(request, catalog.reserve(), VideoInit::new(format, init)).unwrap();
+			let mut import = Track::video(request, catalog.clocked().reserve(), VideoInit::new(format, init)).unwrap();
 
 			import
 				.decode(keyframe, Some(Timestamp::from_micros(1_000).unwrap()))

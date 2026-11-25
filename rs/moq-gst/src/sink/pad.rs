@@ -1492,10 +1492,13 @@ mod tests {
 
 	/// Caps the importer does not configure from keep the track live, so a reader subscribed before
 	/// the renegotiation reads on into the new caps rather than seeing the track end.
-	#[tokio::test]
+	#[tokio::test(start_paused = true)]
 	async fn renegotiation_keeps_an_established_reader() {
 		gst::init().unwrap();
 		let (broadcast, catalog) = producers();
+		// The buffers shift onto the catalog clock by its reading at the first one, which paused
+		// time holds still.
+		let zero = catalog.clock().now().as_millis().unwrap();
 		let mut pad = Pad::new();
 		pad.observe_caps(&broadcast, &catalog, producer_options(&h264_caps(), Some("camera")));
 		pad.observe_segment(time_segment());
@@ -1527,7 +1530,7 @@ mod tests {
 		loop {
 			let group = subscriber.recv_group().await.unwrap().expect("the track continues");
 			let start = moq_net::Timestamp::new(group.start, group.timescale().unwrap()).unwrap();
-			if start.as_millis().unwrap() == 80 {
+			if start.as_millis().unwrap() == zero + 80 {
 				break;
 			}
 		}
@@ -1557,7 +1560,10 @@ mod tests {
 			pad.observe_caps(&broadcast, &catalog, producer_options(&vp8, Some("camera"))),
 			CapsOutcome::Active("camera/1".to_string())
 		);
-		assert_eq!(subscriber.recv_group().await.unwrap().expect("a group").start, 0);
+		assert!(
+			subscriber.recv_group().await.unwrap().is_some(),
+			"the old track kept its group"
+		);
 		assert!(subscriber.recv_group().await.unwrap().is_none(), "the old track ended");
 	}
 

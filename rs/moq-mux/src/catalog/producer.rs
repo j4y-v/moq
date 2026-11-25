@@ -805,6 +805,19 @@ impl<E: CatalogExt> Producer<E> {
 		super::Timebase::new(self.clone())
 	}
 
+	/// A timestamp base for frames already stamped from [`clock`](Self::clock), such as
+	/// [`Clock::now`](crate::Clock::now) or [`Clock::capture`](crate::Clock::capture): taking it fixes
+	/// the clock, and its renditions publish their timestamps unshifted.
+	///
+	/// Use it for an encoder that reads the clock itself; a source with its own timestamps (RTP, a
+	/// container's PTS, a caller's capture time) reserves through [`timebase`](Self::timebase)
+	/// instead, whose renditions shift them onto this clock. A placement on it is refused, as on
+	/// any anchored timebase.
+	pub fn clocked(&self) -> super::Timebase<E> {
+		self.clock();
+		super::Timebase::verbatim(self.clone())
+	}
+
 	/// Begin reserving the initial track set, returning a clonable [`Reserved`](super::Reserved).
 	///
 	/// Hand it (or clones) to importers, or call its role-specific track constructors. The catalog is
@@ -818,6 +831,8 @@ impl<E: CatalogExt> Producer<E> {
 	///
 	/// Each call is a fresh [`Timebase`](super::Timebase): an importer handed it shifts its timestamps by
 	/// its own offset. Reserve through one timebase instead for importers sharing a timestamp base.
+	/// A writer whose frames are already stamped from [`clock`](Self::clock) reserves through
+	/// [`clocked`](Self::clocked) instead, or its frames shift a second time.
 	pub fn reserve(&self) -> super::Reserved<E> {
 		self.timebase().reserve()
 	}
@@ -832,8 +847,9 @@ impl<E: CatalogExt> Producer<E> {
 	pub(super) fn rendition<C: super::RenditionConfig<E>>(
 		&self,
 		name: impl Into<String>,
+		timebase: super::Timebase<E>,
 	) -> crate::Result<super::Rendition<E, C>> {
-		super::Rendition::live(self.clone(), name.into())
+		super::Rendition::live(self.clone(), name.into(), timebase)
 	}
 
 	/// Publish a video track and own its catalog rendition.
@@ -887,7 +903,7 @@ impl<E: CatalogExt> Producer<E> {
 		R: super::RenditionConfig<E>,
 		crate::Error: From<C::Error>,
 	{
-		let rendition = self.rendition(track.name())?;
+		let rendition = self.rendition(track.name(), self.timebase())?;
 		self.media(track, container, rendition, config.into(), None)
 	}
 
@@ -3147,12 +3163,12 @@ mod test {
 		let mut consumer: Consumer = Consumer::new(catalog.outputs.hang_track.consume());
 		let waiter = kio::Waiter::noop();
 
-		let _unresolved = catalog.rendition::<VideoConfig>("video0").unwrap();
+		let _unresolved = catalog.rendition::<VideoConfig>("video0", catalog.timebase()).unwrap();
 		assert!(
-			catalog.rendition::<VideoConfig>("video0").is_err(),
+			catalog.rendition::<VideoConfig>("video0", catalog.timebase()).is_err(),
 			"the unresolved live rendition owns its name"
 		);
-		let mut audio = catalog.rendition::<AudioConfig>("audio0").unwrap();
+		let mut audio = catalog.rendition::<AudioConfig>("audio0", catalog.timebase()).unwrap();
 		audio.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2)).unwrap();
 
 		let snapshot = match consumer.poll_next(&waiter) {

@@ -4089,8 +4089,6 @@ fn double_close_all_resource_types() {
 /// it was published, whatever epoch the caller counts from, on a fresh catalog and on one whose
 /// clock was fixed earlier.
 #[test]
-#[ignore = "moq-dev/moq#9507: needs codec importers to shift their caller's timestamps through \
-            their Timebase"]
 fn media_frames_land_on_the_catalog_clock_when_published() {
 	for fixed in [false, true] {
 		let origin = id(moq_origin_create());
@@ -5926,7 +5924,7 @@ fn local_publish_consume() {
 	};
 	assert_eq!(unsafe { encoded_frame(frame_id, &mut frame) }, 0);
 	assert_eq!(frame.payload_size, payload.len());
-	assert_eq!(read_timestamp(frame.timestamp), micros(timestamp_us));
+	// The caller's timestamp shifts onto the catalog clock; media_frames_land_on_the_catalog_clock_when_published covers where.
 
 	let received = unsafe { std::slice::from_raw_parts(frame.payload, frame.payload_size) };
 	assert_eq!(received, payload, "frame payload should match");
@@ -6109,7 +6107,7 @@ fn consume_audio_follows_a_sibling_broadcast_reference() {
 	assert_eq!(unsafe { encoded_frame(frame_id, &mut frame) }, 0);
 	let received = unsafe { std::slice::from_raw_parts(frame.payload, frame.payload_size) };
 	assert_eq!(received, payload, "the sibling broadcast's frame should arrive");
-	assert_eq!(read_timestamp(frame.timestamp), micros(timestamp_us));
+	// Its timestamp shifts onto the catalog clock: see media_frames_land_on_the_catalog_clock_when_published.
 
 	assert_eq!(moq_consume_read_free(frame_id), 0);
 	assert_eq!(moq_consume_audio_cancel(track), 0);
@@ -6726,7 +6724,7 @@ fn video_publish_consume() {
 		keyframe: false,
 	};
 	assert_eq!(unsafe { encoded_frame(frame_id, &mut frame) }, 0);
-	assert_eq!(read_timestamp(frame.timestamp), micros(0));
+	// The caller's timestamp shifts onto the catalog clock; media_frames_land_on_the_catalog_clock_when_published covers where.
 	assert!(frame.payload_size > 0, "frame should have payload data");
 
 	assert_eq!(moq_consume_read_free(frame_id), 0);
@@ -7760,6 +7758,8 @@ fn multiple_frames_ordering() {
 		);
 	}
 
+	// The timestamps shift onto the catalog clock by one offset, keeping their spacing.
+	let mut base = None;
 	for (i, &expected_ts) in timestamps.iter().enumerate() {
 		let frame_id = id(frame_cb.recv());
 		let mut frame = moq_frame {
@@ -7769,11 +7769,9 @@ fn multiple_frames_ordering() {
 			keyframe: false,
 		};
 		assert_eq!(unsafe { encoded_frame(frame_id, &mut frame) }, 0);
-		assert_eq!(
-			read_timestamp(frame.timestamp),
-			micros(expected_ts),
-			"frame {i} has wrong timestamp"
-		);
+		let at = read_timestamp(frame.timestamp).value;
+		let base = *base.get_or_insert(at - expected_ts);
+		assert_eq!(at, base + expected_ts, "frame {i} has wrong timestamp");
 
 		let received = unsafe { std::slice::from_raw_parts(frame.payload, frame.payload_size) };
 		let expected = format!("frame-{i}");

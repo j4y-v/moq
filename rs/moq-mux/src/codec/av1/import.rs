@@ -225,6 +225,7 @@ impl Import {
 
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> Result<()> {
+		let end = self.track.shifted(end)?;
 		self.track.cut(end)?;
 		Ok(())
 	}
@@ -243,6 +244,7 @@ impl Import {
 
 	/// Close the current group and open the next one at `start`.
 	pub fn seek(&mut self, start: u64) -> Result<()> {
+		let start = self.track.shifted_start(start)?;
 		self.track.seek(start)?;
 		Ok(())
 	}
@@ -268,6 +270,8 @@ impl Import {
 
 			// A pre-keyframe delta has no group to anchor it: the producer returns
 			// MissingKeyframe, which a caller joining mid-stream skips.
+			// The caller's timestamp shifts onto the catalog clock by the rendition's timebase.
+			frame.timestamp = self.track.timestamp(Some(frame.timestamp))?;
 			self.track.write(frame)?;
 		}
 		Ok(())

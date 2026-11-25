@@ -124,6 +124,7 @@ impl Import {
 
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
+		let end = self.track.shifted(end)?;
 		self.track.cut(end)?;
 		Ok(())
 	}
@@ -142,6 +143,7 @@ impl Import {
 
 	/// Close the current group and open the next one at `start`.
 	pub fn seek(&mut self, start: u64) -> crate::Result<()> {
+		let start = self.track.shifted_start(start)?;
 		self.track.seek(start)?;
 		Ok(())
 	}
@@ -199,7 +201,7 @@ mod tests {
 	async fn a_loc_reservation_reaches_the_wire_and_the_catalog() {
 		let (track, catalog) = setup();
 		let subscriber = track.subscribe(None);
-		let reserved = catalog.reserve();
+		let reserved = catalog.clocked().reserve();
 		let hint = crate::catalog::VideoHint {
 			codec: Some(hang::catalog::VideoCodec::VP8),
 			container: hang::catalog::Container::Loc,

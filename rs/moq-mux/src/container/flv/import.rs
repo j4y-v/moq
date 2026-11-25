@@ -642,8 +642,8 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		// Past the initial reservation, a fresh one still holds an unpublished catalog for this
 		// track's first keyframe, and holds nothing once the catalog went out.
 		let reserved = match &self.initial_reservation {
-			Some(reserved) => reserved.clone(),
-			None => self.timebase.reserve(),
+			Some(reserved) => reserved.verbatim(),
+			None => self.timebase.shifted().reserve(),
 		};
 		let hint = crate::catalog::VideoHint {
 			container: self.container.clone(),
