@@ -1,6 +1,7 @@
 //! Pull one RTSP session into a broadcast.
 
 use futures::StreamExt;
+use moq_mux::catalog::placement::{Frame, Placement, Step};
 use moq_mux::codec::{aac, h264, h265};
 use moq_tokio::RedactedUrl;
 use retina::client::{Credentials, PlayOptions, Session, SessionOptions, SetupOptions, Transport};
@@ -40,14 +41,6 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Generous, since a camera's "smart" codec can stretch the keyframe interval well past 10s.
 const KEYFRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long before its arrival a sender report may say a frame was captured: longer than any
-/// encoder and network take. Further back is a camera clock set wrong, or never set.
-const MAX_CAPTURE_LATENCY: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// How far after its arrival a sender report may say a frame was captured, a camera clock
-/// slightly ahead of this host's: timed at its arrival instead. Further ahead is a clock set wrong.
-const MAX_CAPTURE_LEAD: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// Why [`Client::pull`] returned without an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -74,8 +67,8 @@ pub struct Client {
 	timeout: std::time::Duration,
 	/// [`MAX_FORWARD`], shortened by tests.
 	max_forward: std::time::Duration,
-	/// See [`Client::with_report_wait`].
-	report_wait: std::time::Duration,
+	/// How long a session waits for a sender report, when a test shortens the placement's default.
+	report_wait: Option<std::time::Duration>,
 }
 
 impl Client {
@@ -115,37 +108,20 @@ impl Client {
 			creds,
 			timeout: TIMEOUT,
 			max_forward: MAX_FORWARD,
-			report_wait: std::time::Duration::ZERO,
+			report_wait: None,
 		})
-	}
-
-	/// Hold the session's start up to `wait` for an RTCP sender report, so its frames are timed
-	/// at the camera's capture rather than at their arrival.
-	///
-	/// The catalog's `sync.clock` places the session on the wall clock once, on its first frame:
-	/// at the capture time the camera's sender report gives for it (its NTP clock), or else at
-	/// the frame's arrival, which trails the capture by the camera's encoding and the network.
-	/// Waiting holds the frames received meanwhile and publishes them once the session is
-	/// placed, so the opening keyframe is kept. Zero, the default, places the session on its
-	/// first frame, on a report only when one came first. Keep it well under the camera's
-	/// keyframe interval and the 30 s a session may go without a keyframe.
-	pub fn with_report_wait(mut self, wait: std::time::Duration) -> Self {
-		self.report_wait = wait;
-		self
 	}
 
 	/// Ingest one session into `broadcast`, publishing its renditions on `catalog`.
 	///
 	/// Publishes the session's H.264 and H.265 video and AAC audio, starting on a keyframe.
 	/// Audio the stack cannot play is skipped with a warning. The session keeps the camera's
-	/// timestamps, counted from PLAY, and places them on the catalog's clock (see
-	/// [`Client::with_report_wait`]), which the catalog waits for. Without a sender report, only the
-	/// first frame is placed, at its arrival, and the later frames' wall times are estimates from it.
-	/// Several sessions can publish renditions of one broadcast by sharing its catalog, but only
-	/// the first places its clock: a later session, like one on a clock fixed beforehand, keeps its
-	/// timestamps, counted from its own PLAY, and logs a warning. Its frames line up with the first
-	/// session's only when both started together; publish independent sessions as separate
-	/// broadcasts.
+	/// timestamps, counted from PLAY, and places them on the catalog's clock where the camera's
+	/// RTCP sender report says they were captured, or at the first frame's arrival when no usable
+	/// report comes within one report interval. The catalog, and the frames since each stream's
+	/// latest keyframe, wait for it. A later session sharing the catalog, like one on a clock fixed
+	/// beforehand, keeps its timestamps, counted from its own PLAY: publish independent sessions as
+	/// separate broadcasts.
 	///
 	/// Never reconnects: returns once the session ends or its timeline jumps, finishing its
 	/// tracks, or fails, aborting them, including when a request or the media stalls. The
@@ -200,15 +176,10 @@ impl Client {
 			video: tracks.iter().any(|(_, kind)| *kind != Kind::Aac),
 			started: false,
 			max_forward: self.max_forward,
-			// Its own reservation holds the catalog, and so the clock, until the session is placed.
-			timing: Timing::Waiting(Box::new(Waiting {
-				gate: timebase.reserve(),
-				timebase: timebase.clone(),
-				catalog: catalog.clone(),
-				wait: self.report_wait,
-				held: Vec::new(),
-				reports: vec![None; session.streams().len()],
-			})),
+			placement: Some(match self.report_wait {
+				Some(wait) => Placement::new(timebase.clone()).with_wait(wait),
+				None => Placement::new(timebase.clone()),
+			}),
 		};
 		ingest.streams.resize_with(session.streams().len(), || None);
 		// A failure here aborts the tracks already made rather than leaving `Drop` to finish them.
@@ -265,18 +236,18 @@ impl Client {
 			// Measured from the last frame, so RTCP reports alone cannot keep a dead camera alive.
 			let mut deadline = playing.saturating_add(self.timeout);
 			let end = loop {
-				// A report wait that ends first releases the frames it held, with or without another.
-				let due = ingest.timing.due(playing).filter(|due| *due < deadline);
-				let item = match kio::clock::timeout_at(due.unwrap_or(deadline), session.next()).await {
+				// A camera that stops during the report wait still gets placed when the wait ends.
+				let wake = ingest.placing().map_or(deadline, |placing| placing.min(deadline));
+				let item = match kio::clock::timeout(wake - kio::clock::now(), session.next()).await {
 					Ok(item) => item,
-					Err(_) if due.is_some() => match ingest.release()? {
+					Err(_) if kio::clock::now() < deadline => match ingest.expire()? {
 						Some(Jump) => break End::Jumped,
 						None => continue,
 					},
 					Err(_) => return Err(Error::Stalled(self.timeout)),
 				};
 				let Some(item) = item else {
-					// A session ending during a report wait still publishes what it held.
+					// A session ending while it waits to be placed still publishes what it held.
 					match ingest.release()? {
 						Some(Jump) => break End::Jumped,
 						None => break End::Closed,
@@ -286,7 +257,7 @@ impl Client {
 				if matches!(item, CodecItem::VideoFrame(_) | CodecItem::AudioFrame(_)) {
 					deadline = kio::clock::now().saturating_add(self.timeout);
 				}
-				if ingest.push(item, session.streams(), playing)?.is_some() {
+				if ingest.push(item, session.streams())?.is_some() {
 					break End::Jumped;
 				}
 				if ingest.awaiting_keyframe(playing, KEYFRAME_TIMEOUT) {
@@ -443,173 +414,46 @@ struct Ingest {
 	started: bool,
 	/// [`MAX_FORWARD`], or a test's override.
 	max_forward: std::time::Duration,
-	/// Whether the session is placed on the catalog's clock yet.
-	timing: Timing,
-}
-
-/// Where the session stands on the catalog's clock.
-enum Timing {
-	/// Not placed yet: holding the catalog, and the frames received meanwhile.
-	Waiting(Box<Waiting>),
-	/// Placed, or left verbatim when it could not be.
-	Placed,
-}
-
-struct Waiting {
-	/// Withholds the catalog, so nothing fixes its clock before [`Timebase::place`].
-	///
-	/// [`Timebase::place`]: moq_mux::catalog::Timebase::place
-	gate: moq_mux::catalog::Reserved,
-	timebase: moq_mux::catalog::Timebase,
-	/// To check the placement took: a clock something fixed earlier keeps its mapping.
-	catalog: moq_mux::catalog::Producer,
-	/// How long after PLAY to wait for a sender report: [`Client::with_report_wait`].
-	wait: std::time::Duration,
-	/// Every frame received while waiting, published in order once placed, each with the video
-	/// parameters its stream had then: retina strips in-band parameter sets, and a later frame
-	/// may change the stream's.
-	held: Vec<(CodecItem, Option<VideoParameters>)>,
-	/// Each stream's latest sender report.
-	reports: Vec<Option<Report>>,
-}
-
-/// One stream's sender report: its RTP time, and the NTP time the camera gave it.
-#[derive(Clone, Copy)]
-struct Report {
-	/// RTP units since the session start.
-	elapsed: i64,
-	/// The NTP time, in Unix microseconds.
-	unix: i128,
-}
-
-impl Timing {
-	/// When a report wait holding frames ends, for a session that started `playing`.
-	fn due(&self, playing: kio::clock::Instant) -> Option<kio::clock::Instant> {
-		match self {
-			Self::Waiting(waiting) if !waiting.held.is_empty() => Some(playing.saturating_add(waiting.wait)),
-			_ => None,
-		}
-	}
-}
-
-impl Waiting {
-	/// Keep a sender report, the stream's latest.
-	fn report(&mut self, rtcp: &retina::rtcp::ReceivedCompoundPacket) {
-		let Some(at) = rtcp.rtp_timestamp() else { return };
-		let Some(Ok(Some(report))) = rtcp.pkts().next().map(|pkt| pkt.as_sender_report()) else {
-			return;
-		};
-		if let Some(slot) = self.reports.get_mut(rtcp.stream_id()) {
-			*slot = Some(Report {
-				elapsed: at.elapsed(),
-				unix: ntp_unix_micros(report.ntp_timestamp().0),
-			});
-		}
-	}
-
-	/// Place the session on the catalog's clock once it can: on a held frame whose stream has a
-	/// sender report, or on the first held frame's arrival once a report proved unusable or the
-	/// wait is `over`. Returns whether the session is placed (or left verbatim) now.
-	fn place(&mut self, over: bool) -> bool {
-		let now = kio::clock::now();
-		let wall = unix_micros(kio::clock::wall());
-		let arrival =
-			|received: kio::clock::Instant| wall - now.saturating_duration_since(received).as_micros() as i128;
-
-		let mut unusable = false;
-		for (item, _) in &self.held {
-			let Some((stream_id, timestamp, received)) = media(item) else {
-				continue;
-			};
-			let Some(report) = self.reports.get(stream_id).copied().flatten() else {
-				continue;
-			};
-			let rate = i128::from(timestamp.clock_rate().get());
-			let captured =
-				report.unix + (i128::from(timestamp.elapsed()) - i128::from(report.elapsed)) * 1_000_000 / rate;
-			let latency = arrival(received) - captured;
-			if latency < -(MAX_CAPTURE_LEAD.as_micros() as i128) || latency > MAX_CAPTURE_LATENCY.as_micros() as i128 {
-				tracing::warn!(
-					stream_id,
-					latency_ms = latency as f64 / 1000.0,
-					"sender report far from the frame's arrival, timing the session on arrival"
-				);
-				unusable = true;
-				break;
-			}
-			// A camera clock a little ahead puts capture after arrival: no frame is from the future.
-			let captured = captured.min(arrival(received));
-			return self.anchor(timestamp, captured, "sender report", latency);
-		}
-
-		let Some((_, timestamp, received)) = self.held.iter().find_map(|(item, _)| media(item)) else {
-			return false;
-		};
-		if !over && !unusable {
-			return false;
-		}
-		self.anchor(timestamp, arrival(received), "arrival", 0)
-	}
-
-	/// Place the session so the frame at `timestamp` lands at `captured` (Unix microseconds).
-	/// A session that cannot be placed keeps its timestamps verbatim, as before. Always settles.
-	fn anchor(&self, timestamp: retina::Timestamp, captured: i128, anchor: &str, latency: i128) -> bool {
-		let since = i128::from(timestamp.elapsed()) * 1_000_000 / i128::from(timestamp.clock_rate().get());
-		let zero = captured - since;
-		let placed = u64::try_from(zero)
-			.ok()
-			.and_then(|micros| kio::clock::Wall::UNIX_EPOCH.checked_add(std::time::Duration::from_micros(micros)))
-			.ok_or_else(|| "PTS zero before 1970".to_string())
-			.and_then(|wall| {
-				let zero = moq_net::Timestamp::from_micros(0).map_err(|err| err.to_string())?;
-				self.timebase.place(zero, wall).map_err(|err| err.to_string())?;
-				Ok(wall)
-			});
-		match placed {
-			// A clock something fixed before this session, such as a shared one, keeps its mapping:
-			// the session's verbatim timestamps then mean nothing on it.
-			Ok(wall) => match self
-				.catalog
-				.snapshot()
-				.sync
-				.clock
-				.map(|clock| clock.wall_clock(moq_net::Timestamp::from_micros(0).expect("zero fits")))
-			{
-				Some(Ok(advertised)) if advertised == wall => tracing::info!(
-					anchor,
-					capture_latency_ms = latency as f64 / 1000.0,
-					"session placed on the catalog's clock"
-				),
-				_ => tracing::warn!(
-					"the catalog's clock was fixed before this session, whose timestamps it does not time"
-				),
-			},
-			Err(err) => tracing::warn!(%err, "cannot place the session on the catalog's clock, keeping its timestamps"),
-		}
-		true
-	}
+	/// Places the session on the catalog's clock, holding its frames until then, each with the
+	/// video parameters its stream had: retina strips in-band parameter sets, and a later frame may
+	/// change the stream's. `None` once the session is placed.
+	placement: Option<Placement<usize, (CodecItem, Option<VideoParameters>)>>,
 }
 
 /// Seconds from the NTP epoch (1900) to the Unix one (1970).
 const NTP_UNIX: i128 = 2_208_988_800;
 
-/// An NTP timestamp (Q32.32 seconds since 1900) in Unix microseconds.
+/// An NTP timestamp (Q32.32 seconds since 1900) as a wall time, or `None` before 1970.
 ///
 /// NTP seconds wrap in 2036; a value below 2^31 is read as the next era (RFC 4330 §3), so a camera
-/// clock never set (zero) reads as 2036, far from any arrival.
-fn ntp_unix_micros(ntp: u64) -> i128 {
+/// clock never set (zero) reads as 2036, far from any arrival. The rest reads from 1968 on.
+fn ntp_wall(ntp: u64) -> Option<kio::clock::Wall> {
 	let mut secs = i128::from(ntp >> 32);
 	if secs < 1 << 31 {
 		secs += 1 << 32;
 	}
-	(secs - NTP_UNIX) * 1_000_000 + ((i128::from(ntp & 0xFFFF_FFFF) * 1_000_000) >> 32)
+	let micros = (secs - NTP_UNIX) * 1_000_000 + ((i128::from(ntp & 0xFFFF_FFFF) * 1_000_000) >> 32);
+	let micros = u64::try_from(micros).ok()?;
+	kio::clock::Wall::UNIX_EPOCH.checked_add(std::time::Duration::from_micros(micros))
 }
 
-/// Microseconds from the Unix epoch to `wall`, negative before it.
-fn unix_micros(wall: kio::clock::Wall) -> i128 {
-	let epoch = kio::clock::Wall::UNIX_EPOCH;
-	wall.saturating_duration_since(epoch).as_micros() as i128
-		- epoch.saturating_duration_since(wall).as_micros() as i128
+/// A sender report: its stream, the RTP time it names, and the NTP time the camera gave that.
+fn sender_report(rtcp: &retina::rtcp::ReceivedCompoundPacket) -> Option<(usize, moq_net::Timestamp, kio::clock::Wall)> {
+	let at = rtcp.rtp_timestamp()?;
+	let report = rtcp.pkts().next()?.as_sender_report().ok()??;
+	let rate = u64::from(at.clock_rate().get());
+	let wall = ntp_wall(report.ntp_timestamp().0)?;
+	// A report naming an RTP time before PLAY names PLAY's too, that much later on the camera's clock.
+	let (units, wall) = match u64::try_from(at.elapsed()) {
+		Ok(units) => (units, wall),
+		Err(_) => {
+			let before = at.elapsed().unsigned_abs();
+			let later = std::time::Duration::from_micros(before.saturating_mul(1_000_000) / rate);
+			(0, wall.checked_add(later)?)
+		}
+	};
+	let pts = moq_net::Timestamp::from_scale(units, rate).ok()?;
+	Some((rtcp.stream_id(), pts, wall))
 }
 
 /// The video parameters `item`'s stream has now.
@@ -623,21 +467,22 @@ fn parameters<'a>(streams: &'a [retina::client::Stream], item: &CodecItem) -> Op
 	}
 }
 
-/// A media item's stream, RTP timestamp, and arrival.
-fn media(item: &CodecItem) -> Option<(usize, retina::Timestamp, kio::clock::Instant)> {
-	match item {
-		CodecItem::VideoFrame(frame) => Some((
+/// A media item's stream, timestamp since PLAY, arrival, and whether it may start its stream, or
+/// `None` for an item before PLAY, which publishes nothing.
+fn media(item: &CodecItem) -> Option<(usize, moq_net::Timestamp, kio::clock::Instant, bool)> {
+	let (stream_id, timestamp, received, keyframe) = match item {
+		CodecItem::VideoFrame(frame) => (
 			frame.stream_id(),
 			frame.timestamp(),
-			kio::clock::Instant::from_std(frame.end_ctx().received()),
-		)),
-		CodecItem::AudioFrame(frame) => Some((
-			frame.stream_id(),
-			frame.timestamp(),
-			kio::clock::Instant::from_std(frame.ctx().received()),
-		)),
-		_ => None,
-	}
+			frame.end_ctx().received(),
+			frame.is_random_access_point(),
+		),
+		CodecItem::AudioFrame(frame) => (frame.stream_id(), frame.timestamp(), frame.ctx().received(), true),
+		_ => return None,
+	};
+	let units = u64::try_from(timestamp.elapsed()).ok()?;
+	let pts = moq_net::Timestamp::from_scale(units, u64::from(timestamp.clock_rate().get())).ok()?;
+	Some((stream_id, pts, kio::clock::Instant::from_std(received), keyframe))
 }
 
 /// Dropping the [`Client::pull`] future stops the session: its tracks end cleanly, so a caller
@@ -661,58 +506,79 @@ struct Jump;
 impl Ingest {
 	/// Publish one depacketized item, or report that the timeline jumped. Until the session is
 	/// placed on the catalog's clock, items are held, then published in order.
-	fn push(
-		&mut self,
-		item: CodecItem,
-		streams: &[retina::client::Stream],
-		playing: kio::clock::Instant,
-	) -> Result<Option<Jump>> {
-		let Timing::Waiting(waiting) = &mut self.timing else {
+	fn push(&mut self, item: CodecItem, streams: &[retina::client::Stream]) -> Result<Option<Jump>> {
+		let Some(placement) = self.placement.take() else {
 			let params = parameters(streams, &item);
 			return self.publish(item, params);
 		};
-		if let CodecItem::Rtcp(rtcp) = &item {
-			waiting.report(rtcp);
-		} else if media(&item).is_some_and(|(stream_id, ..)| self.streams.get(stream_id).is_some_and(Option::is_some)) {
-			let params = parameters(streams, &item).cloned();
-			waiting.held.push((item, params));
-		}
-		// Checked here too, not only when the pull loop wakes for it: a timeout polls the session
-		// first, so frames that keep arriving ready would hold that wake off.
-		let over = kio::clock::now() >= playing.saturating_add(waiting.wait);
-		if !waiting.place(over) {
-			return Ok(None);
-		}
-		self.replay()
+		let step = match &item {
+			CodecItem::Rtcp(rtcp) => match sender_report(rtcp) {
+				Some((stream, pts, wall)) => placement.report(stream, pts, wall)?,
+				None => Step::Waiting(placement),
+			},
+			_ => match media(&item) {
+				Some((stream, pts, arrival, keyframe)) if self.streams.get(stream).is_some_and(Option::is_some) => {
+					let params = parameters(streams, &item).cloned();
+					placement.hold(Frame {
+						stream,
+						pts,
+						arrival,
+						keyframe,
+						item: (item, params),
+					})?
+				}
+				// Nothing the session publishes, such as a picture before PLAY: no reason to hold it.
+				_ => {
+					self.placement = Some(placement);
+					let params = parameters(streams, &item);
+					return self.publish(item, params);
+				}
+			},
+		};
+		self.step(step)
 	}
 
 	/// Place a session still waiting on its first held frame's arrival, and publish what it held:
-	/// once its report wait is over, or once it ends. The pull loop wakes for the first.
+	/// for a session that ends first.
 	fn release(&mut self) -> Result<Option<Jump>> {
-		let Timing::Waiting(waiting) = &mut self.timing else {
-			return Ok(None);
-		};
-		if !waiting.place(true) {
-			return Ok(None);
+		match self.placement.take() {
+			Some(placement) => self.replay(placement.finish()?),
+			None => Ok(None),
 		}
-		self.replay()
+	}
+
+	/// When the report wait ends with no frame to end it, while the session waits to be placed.
+	fn placing(&self) -> Option<kio::clock::Instant> {
+		self.placement.as_ref().and_then(Placement::deadline)
+	}
+
+	/// Place a session whose report wait is over, publishing what it held.
+	fn expire(&mut self) -> Result<Option<Jump>> {
+		match self.placement.take() {
+			Some(placement) => self.step(placement.expire()?),
+			None => Ok(None),
+		}
+	}
+
+	/// Keep waiting, or publish what the session held now that it is placed.
+	fn step(&mut self, step: Step<usize, (CodecItem, Option<VideoParameters>)>) -> Result<Option<Jump>> {
+		match step {
+			Step::Waiting(placement) => {
+				self.placement = Some(placement);
+				Ok(None)
+			}
+			Step::Placed(held) => self.replay(held),
+		}
 	}
 
 	/// Publish the frames held while waiting, now that the session is placed.
-	fn replay(&mut self) -> Result<Option<Jump>> {
-		let Timing::Waiting(waiting) = std::mem::replace(&mut self.timing, Timing::Placed) else {
-			unreachable!("matched above");
-		};
-		// The session is placed: the catalog may go out.
-		let Waiting { gate, held, .. } = *waiting;
-		drop(gate);
-		let mut jumped = None;
+	fn replay(&mut self, held: Vec<(CodecItem, Option<VideoParameters>)>) -> Result<Option<Jump>> {
 		for (item, params) in held {
-			if jumped.is_none() {
-				jumped = self.publish(item, params.as_ref())?;
+			if let Some(jump) = self.publish(item, params.as_ref())? {
+				return Ok(Some(jump));
 			}
 		}
-		Ok(jumped)
+		Ok(None)
 	}
 
 	/// Publish one depacketized item under its stream's video `params`, or report that the timeline
@@ -815,8 +681,8 @@ impl Ingest {
 	}
 
 	/// Whether a video stream has waited longer than `timeout` for a keyframe: its first since
-	/// `playing`, or its next since a loss held it. A session waiting for a sender report holds
-	/// its keyframes, so that wait counts too.
+	/// `playing`, or its next since a loss held it. A session waiting to be placed holds its
+	/// keyframes, so that wait counts too.
 	fn awaiting_keyframe(&self, playing: kio::clock::Instant, timeout: std::time::Duration) -> bool {
 		self.streams.iter().flatten().any(|stream| {
 			let since = match stream.held {
@@ -856,6 +722,27 @@ mod tests {
 	const WAIT: Duration = Duration::from_secs(10);
 	/// 30 fps at the RTP video clock.
 	const FRAME: u32 = 3000;
+
+	/// A client whose session is placed on its first frame's arrival, unless a test waits for a
+	/// sender report.
+	fn client(url: Url) -> Result<Client> {
+		Ok(Client::new(url)?.waiting(Duration::ZERO))
+	}
+
+	impl Client {
+		/// Wait up to `wait` after the first frame for a sender report.
+		fn waiting(mut self, wait: Duration) -> Self {
+			self.report_wait = Some(wait);
+			self
+		}
+	}
+
+	/// Microseconds from the Unix epoch to `wall`, negative before it.
+	fn unix_micros(wall: kio::clock::Wall) -> i128 {
+		let epoch = kio::clock::Wall::UNIX_EPOCH;
+		wall.saturating_duration_since(epoch).as_micros() as i128
+			- epoch.saturating_duration_since(wall).as_micros() as i128
+	}
 
 	#[expect(
 		clippy::disallowed_methods,
@@ -950,7 +837,7 @@ mod tests {
 	async fn h264_and_aac_start_on_a_keyframe() {
 		let server = Server::bind(vec![Media::H264 { sprop: true }, Media::Aac]).await;
 		let (broadcast, catalog) = broadcast();
-		let client = Client::new(server.url()).unwrap();
+		let client = client(server.url()).unwrap();
 		let pull = tokio::spawn({
 			let (broadcast, catalog) = (broadcast.clone(), catalog.clone());
 			async move { client.pull(&broadcast, &catalog).await }
@@ -1013,7 +900,7 @@ mod tests {
 	async fn h264_starts_on_a_recovery_point() {
 		let server = Server::bind(vec![Media::H264 { sprop: true }]).await;
 		let (broadcast, catalog) = broadcast();
-		let client = Client::new(server.url()).unwrap();
+		let client = client(server.url()).unwrap();
 		let pull = tokio::spawn({
 			let (broadcast, catalog) = (broadcast.clone(), catalog.clone());
 			async move { client.pull(&broadcast, &catalog).await }
@@ -1050,7 +937,7 @@ mod tests {
 	async fn h265_starts_on_a_cra() {
 		let server = Server::bind(vec![Media::H265]).await;
 		let (broadcast, catalog) = broadcast();
-		let client = Client::new(server.url()).unwrap();
+		let client = client(server.url()).unwrap();
 		let pull = tokio::spawn({
 			let (broadcast, catalog) = (broadcast.clone(), catalog.clone());
 			async move { client.pull(&broadcast, &catalog).await }
@@ -1097,7 +984,7 @@ mod tests {
 	async fn g711_is_skipped() {
 		let server = Server::bind(vec![Media::H264 { sprop: true }, Media::Pcmu]).await;
 		let (broadcast, catalog) = broadcast();
-		let client = Client::new(server.url()).unwrap();
+		let client = client(server.url()).unwrap();
 		let pull = tokio::spawn({
 			let (broadcast, catalog) = (broadcast.clone(), catalog.clone());
 			async move { client.pull(&broadcast, &catalog).await }
@@ -1116,7 +1003,7 @@ mod tests {
 	async fn no_supported_stream_is_refused() {
 		let server = Server::bind(vec![Media::Pcmu]).await;
 		let (broadcast, catalog) = broadcast();
-		let client = Client::new(server.url()).unwrap();
+		let client = client(server.url()).unwrap();
 		let pull = tokio::spawn(async move { client.pull(&broadcast, &catalog).await });
 		// DESCRIBE only: the client gives up before SETUP, so `accept` never sees a PLAY.
 		let _accept = tokio::spawn(async move { server.accept(0).await });
@@ -1131,7 +1018,7 @@ mod tests {
 		// Parameter sets in band only, as many cameras send them.
 		let server = Server::bind(vec![Media::H264 { sprop: false }]).await;
 		let (broadcast, catalog) = broadcast();
-		let client = Client::new(server.url()).unwrap();
+		let client = client(server.url()).unwrap();
 		let pull = tokio::spawn({
 			let (broadcast, catalog) = (broadcast.clone(), catalog.clone());
 			async move { client.pull(&broadcast, &catalog).await }
@@ -1159,8 +1046,8 @@ mod tests {
 		tokio::spawn(moq_net::time::run(driver));
 		let sd = Server::bind(vec![Media::H264 { sprop: true }]).await;
 		let hd = Server::bind(vec![Media::H265]).await;
-		let sd_client = Client::new(sd.url()).unwrap();
-		let hd_client = Client::new(hd.url()).unwrap();
+		let sd_client = client(sd.url()).unwrap();
+		let hd_client = client(hd.url()).unwrap();
 
 		let (published_tx, mut published) = tokio::sync::mpsc::unbounded_channel();
 		let caller = tokio::spawn({
@@ -1235,7 +1122,7 @@ mod tests {
 		url.set_username("admin").unwrap();
 		url.set_password(Some("p%40ss%20word")).unwrap();
 
-		let client = Client::new(url).unwrap();
+		let client = client(url).unwrap();
 		let debug = format!("{client:?}");
 		assert!(!debug.contains("admin") && !debug.contains("ss"), "{debug}");
 		assert!(client.url.username().is_empty() && client.url.password().is_none());
@@ -1256,7 +1143,7 @@ mod tests {
 		let clock = manual();
 		let server = Server::bind(vec![Media::H264 { sprop: true }]).await;
 		let (broadcast, catalog) = broadcast();
-		let client = Client::new(server.url()).unwrap();
+		let client = client(server.url()).unwrap();
 		let pull = tokio::spawn({
 			let (broadcast, catalog) = (broadcast.clone(), catalog.clone());
 			async move { client.pull(&broadcast, &catalog).await }
@@ -1293,7 +1180,7 @@ mod tests {
 		let clock = manual();
 		let server = Server::bind(vec![Media::H264 { sprop: true }]).await;
 		let (broadcast, catalog) = broadcast();
-		let client = Client::new(server.url()).unwrap();
+		let client = client(server.url()).unwrap();
 		let pull = tokio::spawn({
 			let catalog = catalog.clone();
 			async move { client.pull(&broadcast, &catalog).await }
@@ -1325,7 +1212,7 @@ mod tests {
 		let clock = manual();
 		let server = Server::bind(vec![Media::H264 { sprop: true }, Media::Aac]).await;
 		let (broadcast, catalog) = broadcast();
-		let mut client = Client::new(server.url()).unwrap();
+		let mut client = client(server.url()).unwrap();
 		// Lengthened so the clock can run well ahead of the frames read and only the keyframe
 		// deadline fires.
 		client.timeout = 10 * KEYFRAME_TIMEOUT;
@@ -1359,7 +1246,7 @@ mod tests {
 		kio::clock::host_time(); // real RTSP sockets, and the pause is real time
 		let server = Server::bind(vec![Media::H264 { sprop: true }]).await;
 		let (broadcast, catalog) = broadcast();
-		let mut client = Client::new(server.url()).unwrap();
+		let mut client = client(server.url()).unwrap();
 		client.max_forward = Duration::from_millis(100);
 		let pull = tokio::spawn({
 			let (broadcast, catalog) = (broadcast.clone(), catalog.clone());
@@ -1384,7 +1271,7 @@ mod tests {
 	async fn packet_loss_waits_for_a_keyframe() {
 		let server = Server::bind(vec![Media::H264 { sprop: true }]).await;
 		let (broadcast, catalog) = broadcast();
-		let client = Client::new(server.url()).unwrap();
+		let client = client(server.url()).unwrap();
 		let pull = tokio::spawn({
 			let (broadcast, catalog) = (broadcast.clone(), catalog.clone());
 			async move { client.pull(&broadcast, &catalog).await }
@@ -1419,7 +1306,7 @@ mod tests {
 	async fn a_lossy_first_keyframe_is_dropped() {
 		let server = Server::bind(vec![Media::H264 { sprop: true }]).await;
 		let (broadcast, catalog) = broadcast();
-		let client = Client::new(server.url()).unwrap();
+		let client = client(server.url()).unwrap();
 		let pull = tokio::spawn({
 			let (broadcast, catalog) = (broadcast.clone(), catalog.clone());
 			async move { client.pull(&broadcast, &catalog).await }
@@ -1462,6 +1349,24 @@ mod tests {
 		(secs << 32) | frac
 	}
 
+	/// Any NTP time a camera sends reads as a wall time or none, never a panic: before 1970 is
+	/// none, and zero (a clock never set) is the next era.
+	#[test]
+	fn ntp_times_map_or_refuse() {
+		let unix = 1_764_000_000_123_456;
+		assert_eq!(ntp_wall(ntp(unix)).map(unix_micros), Some(unix));
+		assert_eq!(ntp_wall((NTP_UNIX as u64 - 1) << 32), None, "1969");
+		assert_eq!(ntp_wall(1 << 63), None, "1968");
+		assert_eq!(
+			ntp_wall(0).map(unix_micros),
+			Some(((1i128 << 32) - NTP_UNIX) * 1_000_000),
+			"2036"
+		);
+		for ntp in [u64::MAX, (1 << 63) - 1, 1] {
+			ntp_wall(ntp);
+		}
+	}
+
 	const H265_KEYFRAME: &[&[u8]] = &[fake::H265_VPS, fake::H265_SPS, fake::H265_PPS, fake::H265_IDR];
 
 	/// Pull `server` into a fresh catalog with `client`, returning the broadcast, its catalog, and
@@ -1486,7 +1391,7 @@ mod tests {
 	#[tokio::test]
 	async fn the_catalog_clock_times_a_frame_at_its_arrival() {
 		let server = Server::bind(vec![Media::H265]).await;
-		let (broadcast, catalog, pull) = pull(Client::new(server.url()).unwrap());
+		let (broadcast, catalog, pull) = pull(client(server.url()).unwrap());
 
 		let mut session = within("PLAY", server.accept(0)).await;
 		let sent = wall_now();
@@ -1521,7 +1426,7 @@ mod tests {
 	async fn a_sender_report_times_the_session_at_capture() {
 		kio::clock::host_time(); // real RTSP sockets, and the report wait is real time
 		let server = Server::bind(vec![Media::H265]).await;
-		let client = Client::new(server.url()).unwrap().with_report_wait(WAIT);
+		let client = client(server.url()).unwrap().waiting(WAIT);
 		let (broadcast, catalog, pull) = pull(client);
 
 		let mut session = within("PLAY", server.accept(1000)).await;
@@ -1554,14 +1459,44 @@ mod tests {
 		assert_eq!(wall_of(&snapshot, &frames[1]), captured + 33_333);
 	}
 
+	/// A camera without RTCP that falls silent during the report wait is still placed when the wait
+	/// ends, rather than holding its catalog until a frame that never comes.
+	#[tokio::test]
+	async fn a_silent_camera_is_placed_when_the_report_wait_ends() {
+		// Real sockets stamp each frame's arrival on the host clock, so the wait runs on it too.
+		kio::clock::host_time();
+		const REPORT_WAIT: Duration = Duration::from_millis(200);
+		let server = Server::bind(vec![Media::H265]).await;
+		let (broadcast, catalog, pull) = pull(client(server.url()).unwrap().waiting(REPORT_WAIT));
+
+		let mut session = within("PLAY", server.accept(0)).await;
+		session.video(0, 0, H265_KEYFRAME).await;
+		session.video(0, FRAME, &[fake::H265_TRAIL]).await;
+		// Nothing follows, so only the end of the wait can publish the catalog.
+		let snapshot = catalog_with(&catalog, 1, 0).await;
+		let published = wall_now();
+		let reader = subscribe(&broadcast, video_track(&snapshot)).await;
+		session.close().await;
+		assert_eq!(within("the pull", pull).await.unwrap().unwrap(), End::Closed);
+
+		let frames = frames(reader).await;
+		assert_eq!(frames.len(), 2, "both held frames publish");
+		let arrived = wall_of(&snapshot, &frames[0]);
+		assert!(
+			published - arrived >= REPORT_WAIT.as_micros() as i128,
+			"published {} µs after the first frame arrived, before the wait was over",
+			published - arrived
+		);
+		assert_eq!(wall_of(&snapshot, &frames[1]) - arrived, 33_333, "one frame later");
+	}
+
 	/// A report far from the frame's arrival is a camera clock set wrong: the session is timed on
 	/// arrival, and the wait ends there.
 	#[tokio::test]
-	#[tracing_test::traced_test]
 	async fn a_sender_report_far_from_arrival_is_ignored() {
 		kio::clock::host_time(); // real RTSP sockets, and the report wait is real time
 		let server = Server::bind(vec![Media::H265]).await;
-		let client = Client::new(server.url()).unwrap().with_report_wait(10 * WAIT);
+		let client = client(server.url()).unwrap().waiting(10 * WAIT);
 		let (broadcast, catalog, pull) = pull(client);
 
 		let mut session = within("PLAY", server.accept(0)).await;
@@ -1581,7 +1516,6 @@ mod tests {
 			"timed {} µs after it was sent",
 			wall - sent
 		);
-		assert!(logs_contain("sender report far from the frame's arrival"));
 	}
 
 	/// A camera whose clock was never set reports NTP time zero: no waiting on it either.
@@ -1589,7 +1523,7 @@ mod tests {
 	async fn a_camera_clock_never_set_ends_the_wait() {
 		kio::clock::host_time(); // real RTSP sockets, and the report wait is real time
 		let server = Server::bind(vec![Media::H265]).await;
-		let client = Client::new(server.url()).unwrap().with_report_wait(10 * WAIT);
+		let client = client(server.url()).unwrap().waiting(10 * WAIT);
 		let (broadcast, catalog, pull) = pull(client);
 
 		let mut session = within("PLAY", server.accept(0)).await;
@@ -1617,7 +1551,7 @@ mod tests {
 		kio::clock::host_time();
 		let server = Server::bind(vec![Media::H265]).await;
 		let wait = Duration::from_millis(200);
-		let client = Client::new(server.url()).unwrap().with_report_wait(wait);
+		let client = client(server.url()).unwrap().waiting(wait);
 		let (broadcast, catalog, pull) = pull(client);
 
 		let mut session = within("PLAY", server.accept(0)).await;
@@ -1636,32 +1570,12 @@ mod tests {
 		assert!(wall >= sent, "timed {} µs before the first frame was sent", sent - wall);
 	}
 
-	/// A report wait that ends with no frame after the held ones still releases them.
-	#[tokio::test]
-	async fn the_end_of_a_report_wait_releases_its_frames_alone() {
-		kio::clock::host_time();
-		let server = Server::bind(vec![Media::H265]).await;
-		let client = Client::new(server.url())
-			.unwrap()
-			.with_report_wait(Duration::from_millis(200));
-		let (broadcast, catalog, pull) = pull(client);
-
-		let mut session = within("PLAY", server.accept(0)).await;
-		session.video(0, 0, H265_KEYFRAME).await;
-		// Nothing else arrives, yet the keyframe publishes once the wait is over, before the end.
-		let snapshot = catalog_with(&catalog, 1, 0).await;
-		let reader = subscribe(&broadcast, video_track(&snapshot)).await;
-		session.close().await;
-		assert_eq!(within("the pull", pull).await.unwrap().unwrap(), End::Closed);
-		assert_eq!(frames(reader).await.len(), 1, "the held keyframe publishes");
-	}
-
 	/// A session ending during its report wait still publishes the frames it held.
 	#[tokio::test]
 	async fn a_session_ending_during_its_report_wait_publishes_what_it_held() {
 		kio::clock::host_time(); // real RTSP sockets, and the report wait is real time
 		let server = Server::bind(vec![Media::H265]).await;
-		let client = Client::new(server.url()).unwrap().with_report_wait(10 * WAIT);
+		let client = client(server.url()).unwrap().waiting(10 * WAIT);
 		let (broadcast, _catalog, pull) = pull(client);
 
 		let mut session = within("PLAY", server.accept(0)).await;
@@ -1687,7 +1601,7 @@ mod tests {
 	async fn a_held_keyframe_keeps_its_parameter_sets() {
 		kio::clock::host_time(); // real RTSP sockets, and the report wait is real time
 		let server = Server::bind(vec![Media::H264 { sprop: true }]).await;
-		let client = Client::new(server.url()).unwrap().with_report_wait(10 * WAIT);
+		let client = client(server.url()).unwrap().waiting(10 * WAIT);
 		let (broadcast, catalog, pull) = pull(client);
 
 		let mut session = within("PLAY", server.accept(0)).await;
@@ -1724,7 +1638,7 @@ mod tests {
 	#[tokio::test]
 	async fn an_audio_only_session_is_timed_on_its_first_frame() {
 		let server = Server::bind(vec![Media::Aac]).await;
-		let (broadcast, catalog, pull) = pull(Client::new(server.url()).unwrap());
+		let (broadcast, catalog, pull) = pull(client(server.url()).unwrap());
 
 		let mut session = within("PLAY", server.accept(0)).await;
 		let sent = wall_now();
@@ -1749,7 +1663,7 @@ mod tests {
 	async fn a_camera_clock_slightly_ahead_is_timed_at_arrival() {
 		kio::clock::host_time(); // real RTSP sockets, and the report wait is real time
 		let server = Server::bind(vec![Media::H265]).await;
-		let client = Client::new(server.url()).unwrap().with_report_wait(10 * WAIT);
+		let client = client(server.url()).unwrap().waiting(10 * WAIT);
 		let (broadcast, catalog, pull) = pull(client);
 
 		let mut session = within("PLAY", server.accept(0)).await;
@@ -1776,7 +1690,7 @@ mod tests {
 	async fn an_audio_report_times_the_video_too() {
 		kio::clock::host_time(); // real RTSP sockets, and the report wait is real time
 		let server = Server::bind(vec![Media::H264 { sprop: true }, Media::Aac]).await;
-		let client = Client::new(server.url()).unwrap().with_report_wait(10 * WAIT);
+		let client = client(server.url()).unwrap().waiting(10 * WAIT);
 		let (broadcast, catalog, pull) = pull(client);
 
 		let mut session = within("PLAY", server.accept(0)).await;
@@ -1800,12 +1714,11 @@ mod tests {
 	}
 
 	/// A catalog whose clock was fixed before the pull, such as one shared by several cameras,
-	/// cannot be moved: the session keeps its timestamps and says so.
+	/// cannot be moved: the session keeps its timestamps.
 	#[tokio::test]
-	#[tracing_test::traced_test]
 	async fn a_clock_fixed_before_the_session_is_left_alone() {
 		let server = Server::bind(vec![Media::H265]).await;
-		let (broadcast, catalog, pull) = pull(Client::new(server.url()).unwrap());
+		let (broadcast, catalog, pull) = pull(client(server.url()).unwrap());
 		let _fixed = catalog.clock();
 
 		let mut session = within("PLAY", server.accept(0)).await;
@@ -1816,7 +1729,6 @@ mod tests {
 		assert_eq!(within("the pull", pull).await.unwrap().unwrap(), End::Closed);
 
 		assert_eq!(frames(reader).await[0].timestamp.as_micros().unwrap(), 0);
-		assert!(logs_contain("the catalog's clock was fixed before this session"));
 	}
 
 	/// Video held after a loss still has to see a keyframe in time, or the pull fails rather
@@ -1826,7 +1738,7 @@ mod tests {
 		let clock = manual();
 		let server = Server::bind(vec![Media::H264 { sprop: true }]).await;
 		let (broadcast, catalog) = broadcast();
-		let mut client = Client::new(server.url()).unwrap();
+		let mut client = client(server.url()).unwrap();
 		// Lengthened so the clock can run well ahead of the frames read and only the keyframe
 		// deadline fires.
 		client.timeout = 10 * KEYFRAME_TIMEOUT;
@@ -1861,7 +1773,7 @@ mod tests {
 		// retina reads `rtptime` only when playing several streams.
 		let server = Server::bind(vec![Media::H264 { sprop: true }, Media::Aac]).await;
 		let (broadcast, catalog) = broadcast();
-		let client = Client::new(server.url()).unwrap();
+		let client = client(server.url()).unwrap();
 		let pull = tokio::spawn(async move { client.pull(&broadcast, &catalog).await });
 
 		let mut session = within("PLAY", server.accept(10 * 90_000)).await;
@@ -1879,7 +1791,7 @@ mod tests {
 		url.set_username("admin").unwrap();
 		url.set_password(Some("wrong")).unwrap();
 
-		let client = Client::new(url).unwrap();
+		let client = client(url).unwrap();
 		let (broadcast, catalog) = broadcast();
 		let pull = tokio::spawn(async move { client.pull(&broadcast, &catalog).await });
 		let _accept = tokio::spawn(async move { server.accept(0).await });
@@ -1890,7 +1802,7 @@ mod tests {
 	#[tokio::test]
 	async fn forbidden_is_unauthorized() {
 		let server = Server::bind(vec![Media::H264 { sprop: true }]).await.forbidden();
-		let client = Client::new(server.url()).unwrap();
+		let client = client(server.url()).unwrap();
 		let (broadcast, catalog) = broadcast();
 		let pull = tokio::spawn(async move { client.pull(&broadcast, &catalog).await });
 		let _accept = tokio::spawn(async move { server.accept(0).await });
@@ -1901,7 +1813,7 @@ mod tests {
 	#[test]
 	fn only_rtsp_urls_are_accepted() {
 		assert!(matches!(
-			Client::new("http://camera/stream".parse().unwrap()),
+			client("http://camera/stream".parse().unwrap()),
 			Err(Error::InvalidUrl(_))
 		));
 	}
