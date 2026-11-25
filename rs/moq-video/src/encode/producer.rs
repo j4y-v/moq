@@ -193,16 +193,20 @@ impl Producer {
 			Some(name) => broadcast.create_track(name, info).ok_or(moq_net::Error::Duplicate)?,
 			None => broadcast.unique_track(suffix(config.codec), info),
 		};
-		let mut producer = Self::with_track(track, &catalog, config, rendition, bandwidth, lower)?;
+		let mut producer = Self::with_track(track, catalog.timebase(), config, rendition, bandwidth, lower)?;
 		producer.encoding = Encoding::Open(sink);
 		Ok(producer)
 	}
 
 	/// Publish `rendition` on `track` with no encoder open yet: the next frame written, or
 	/// [`open`](Self::open), opens one.
+	///
+	/// Its frames shift onto the catalog clock by `timebase`: [`clocked`](moq_mux::catalog::Producer::clocked)
+	/// for frames stamped from that clock, as a capture does, and a source's own
+	/// [`timebase`](moq_mux::catalog::Producer::timebase) for a caller's timestamps.
 	pub(crate) fn with_track<E: CatalogExt>(
 		track: moq_net::track::Producer,
-		catalog: &moq_mux::catalog::Producer<E>,
+		timebase: moq_mux::catalog::Timebase<E>,
 		mut config: Config,
 		rendition: hang::catalog::VideoConfig,
 		allocator: moq_net::bandwidth::Allocator,
@@ -211,7 +215,7 @@ impl Producer {
 		let priority = track.info().priority;
 		let publisher = Publisher::new(
 			track,
-			catalog.reserve().with_interval(config.effective_join()),
+			timebase.reserve().with_interval(config.effective_join()),
 			rendition,
 		)?;
 		let ceiling = config.resolved_bitrate();
@@ -866,7 +870,7 @@ mod tests {
 			.create_track(name, catalog.track_info(hang::catalog::PRIORITY.video))
 			.unwrap();
 		let config = config(encoder::Kind::Named(probe::NAME.into()), ceiling);
-		Producer::with_track(track, catalog, config, rendition(), bandwidth, lower).unwrap()
+		Producer::with_track(track, catalog.timebase(), config, rendition(), bandwidth, lower).unwrap()
 	}
 
 	/// A mid-gray frame at `micros`, advancing it by one frame at 30 fps.
@@ -1480,7 +1484,8 @@ mod tests {
 		let config = config(encoder::Kind::Software, Rate::from_mbps(1));
 		let rendition = config.probe().await.unwrap();
 		let unlimited = moq_net::bandwidth::Allocator::unlimited();
-		let mut producer = Producer::with_track(track.clone(), &catalog, config, rendition, unlimited, None).unwrap();
+		let mut producer =
+			Producer::with_track(track.clone(), catalog.timebase(), config, rendition, unlimited, None).unwrap();
 		let mut micros = 0;
 
 		producer.write(frame(&mut micros)).await.unwrap();

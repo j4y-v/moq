@@ -554,7 +554,8 @@ impl<E: CatalogExt> Driver<E> {
 			let lower = producers.last().map(Producer::rung);
 			producers.push(Producer::with_track(
 				track.clone(),
-				&self.catalog,
+				// Frames are stamped from the catalog clock as they are captured, so they publish unshifted.
+				self.catalog.clocked(),
 				config,
 				rendition,
 				options.bandwidth.clone(),
@@ -1160,7 +1161,7 @@ mod tests {
 		let mut probe = config.clone();
 		probe.kind = encoder::Kind::Software;
 		let rendition = probe.probe().await.unwrap();
-		Producer::with_track(track, catalog, config, rendition, bandwidth, None).unwrap()
+		Producer::with_track(track, catalog.clocked(), config, rendition, bandwidth, None).unwrap()
 	}
 
 	/// A rendition takes a fraction strictly between nothing and the whole picture, under a name
@@ -2592,8 +2593,10 @@ mod tests {
 				probe.kind = encoder::Kind::Software;
 				let rendition = probe.probe().await.unwrap();
 				let lower = producers.last().map(Producer::rung);
-				producers
-					.push(Producer::with_track(track, &catalog, config, rendition, bandwidth.clone(), lower).unwrap());
+				producers.push(
+					Producer::with_track(track, catalog.clocked(), config, rendition, bandwidth.clone(), lower)
+						.unwrap(),
+				);
 			}
 			let ceilings: Vec<_> = ceilings.iter().map(|rate| rate.as_bps()).collect();
 
