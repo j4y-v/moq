@@ -143,8 +143,14 @@ mod tests {
 		let catalog =
 			moq_mux::catalog::Producer::new(&mut route.broadcast().clone(), moq_mux::catalog::Config::default())
 				.expect("create source catalog");
-		let bridge = crate::codec::opus::Bridge::new(route.broadcast().clone(), catalog.clone(), 48_000, 2)
-			.expect("create Opus bridge");
+		let bridge = crate::codec::opus::Bridge::new(
+			route.broadcast().clone(),
+			catalog.clone(),
+			catalog.timebase(),
+			48_000,
+			2,
+		)
+		.expect("create Opus bridge");
 		(route, Box::new(bridge), catalog)
 	}
 
@@ -655,7 +661,8 @@ mod tests {
 		let catalog =
 			moq_mux::catalog::Producer::new(&mut broadcast.broadcast().clone(), moq_mux::catalog::Config::default())
 				.unwrap();
-		let mut vp8 = crate::codec::vp8::Bridge::new(broadcast.broadcast().clone(), catalog).unwrap();
+		let mut vp8 =
+			crate::codec::vp8::Bridge::new(broadcast.broadcast().clone(), catalog.clone(), catalog.timebase()).unwrap();
 		// A VP8 keyframe header for 320x240.
 		push(
 			&mut vp8,
@@ -721,8 +728,14 @@ mod tests {
 		let catalog =
 			moq_mux::catalog::Producer::new(&mut source.broadcast().clone(), moq_mux::catalog::Config::default())
 				.expect("create source catalog");
-		let mut opus = crate::codec::opus::Bridge::new(source.broadcast().clone(), catalog, 48_000, 2)
-			.expect("create Opus bridge");
+		let mut opus = crate::codec::opus::Bridge::new(
+			source.broadcast().clone(),
+			catalog.clone(),
+			catalog.timebase(),
+			48_000,
+			2,
+		)
+		.expect("create Opus bridge");
 		let mut live = Live::new(&mut opus);
 		live.push(OPUS_PACKET);
 		let (announcement, announcement_active) = kio::clock::timeout(TIMEOUT, next_update(&mut announcements))

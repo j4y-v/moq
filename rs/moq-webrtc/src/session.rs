@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use kio::clock::Instant;
 
+use moq_mux::catalog::placement::{Frame, Placement, Step};
 use str0m::{Candidate, Event, Rtc};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -42,6 +43,10 @@ const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 /// for any flow where RTP arrives from the peer (`server publish` / WHIP
 /// server, `client subscribe` / WHEP client).
 pub trait MediaSink: Send {
+	/// The timestamp base every track of the sink shares, which the session places on the wall clock
+	/// before any frame reaches the sink.
+	fn timebase(&self) -> moq_mux::catalog::Timebase;
+
 	/// Called once str0m has confirmed which codec is on which `mid`.
 	fn on_track(
 		&mut self,
@@ -113,6 +118,9 @@ pub struct Session {
 	/// Rebases each ingested track's raw RTP timestamps onto one session
 	/// timeline so audio and video stay in sync. Unused by egress sessions.
 	ingest_clock: IngestClock,
+	/// Places the sink's timebase on the wall clock at its first frame's arrival, withholding the
+	/// catalog until then. `Some` only while an ingest session waits for that frame.
+	placement: Option<Placement<str0m::media::Mid, Pending>>,
 	/// Maps the shared MoQ presentation timeline to str0m's sender-report
 	/// wallclock. Unused by ingest sessions.
 	egress_clock: EgressClock,
@@ -127,6 +135,7 @@ impl Session {
 	/// Convenience for the ingest case (WHIP server, WHEP client). The socket's
 	/// `inbound` comes from the server mux, or [`crate::ice::reader`] for a 1:1 client socket.
 	pub fn ingest(rtc: Rtc, socket: crate::ice::Socket, sink: Box<dyn MediaSink>) -> Result<Self> {
+		let placement = ingest_placement(sink.timebase());
 		Ok(Self {
 			agent: crate::ice::Agent::new(rtc, socket)?,
 			role: MediaRole::Ingest(sink),
@@ -134,6 +143,7 @@ impl Session {
 			writes_rx: None,
 			catalog: Catalog::Settled,
 			ingest_clock: IngestClock::default(),
+			placement: Some(placement),
 			egress_clock: EgressClock::default(),
 			rate: None,
 			ingest_order: IngestOrder::default(),
@@ -152,6 +162,7 @@ impl Session {
 			writes_rx: Some(writes_rx),
 			catalog: Catalog::Following(catalog_end),
 			ingest_clock: IngestClock::default(),
+			placement: None,
 			egress_clock: EgressClock::default(),
 			rate: None,
 			ingest_order: IngestOrder::default(),
@@ -183,6 +194,10 @@ impl Session {
 	pub fn finish(self, linger: std::time::Duration) -> Result<Option<moq_mux::Linger<Box<dyn MediaSink>>>> {
 		match self.role {
 			MediaRole::Ingest(mut sink) => {
+				// A session that ends during the report wait still publishes what it held.
+				if let Some(placement) = self.placement {
+					deliver(sink.as_mut(), placement.finish()?)?;
+				}
 				let broadcast = sink.finish()?;
 				Ok(Some(moq_mux::Linger::new([broadcast], sink, linger)))
 			}
@@ -341,17 +356,21 @@ impl Session {
 					if mapped.deferred && self.ingest_order.keyframe_due(data.mid, Instant::now()) {
 						request_keyframe(&mut self.agent, data.mid, data.rid)?;
 					}
-					if mapped.stepped {
-						sink.on_discontinuity(data.mid)?;
-					}
-					let timestamp_us = mapped.timestamp_us;
-					sink.on_frame(
-						data.mid,
-						codec::Frame {
-							timestamp_us,
+					let pending = Pending {
+						mid: data.mid,
+						frame: codec::Frame {
+							timestamp_us: mapped.timestamp_us,
 							payload: bytes::Bytes::from_owner(data.data),
 						},
-					)?;
+						stepped: mapped.stepped,
+					};
+					match self.placement.take() {
+						Some(placement) => {
+							let step = take_frame(placement, pending, arrival, opens_group)?;
+							self.placement = settle(sink.as_mut(), step)?;
+						}
+						None => deliver(sink.as_mut(), [pending])?,
+					}
 				}
 			}
 			Event::SenderFeedback(feedback) => {
@@ -793,6 +812,64 @@ impl SenderAnchor {
 
 fn to_u64(value: i128) -> u64 {
 	value.clamp(0, u64::MAX as i128) as u64
+}
+
+/// A frame on its way to the sink, with whether its line's timeline stepped to it.
+struct Pending {
+	mid: str0m::media::Mid,
+	frame: codec::Frame,
+	stepped: bool,
+}
+
+/// An ingest's placement: at its first frame's arrival, waiting for no sender report. A WebRTC
+/// publisher reports its audio only every RTCP interval (5 s), the first after its first frame,
+/// so waiting would hold the catalog that long, while placing at arrival errs by no more than the
+/// publisher's network latency.
+fn ingest_placement(timebase: moq_mux::catalog::Timebase) -> Placement<str0m::media::Mid, Pending> {
+	Placement::new(timebase).with_wait(Duration::ZERO)
+}
+
+/// Give `placement` a frame that arrived at `arrival`. Placed, the frames to deliver end with
+/// this one.
+fn take_frame(
+	placement: Placement<str0m::media::Mid, Pending>,
+	pending: Pending,
+	arrival: Instant,
+	opens_group: bool,
+) -> Result<Step<str0m::media::Mid, Pending>> {
+	let pts = moq_net::Timestamp::from_micros(pending.frame.timestamp_us).map_err(moq_mux::Error::from)?;
+	Ok(placement.hold(Frame {
+		stream: pending.mid,
+		pts,
+		arrival,
+		keyframe: opens_group,
+		item: pending,
+	})?)
+}
+
+/// Keep waiting, or deliver what the session held now that it is placed.
+fn settle(
+	sink: &mut dyn MediaSink,
+	step: Step<str0m::media::Mid, Pending>,
+) -> Result<Option<Placement<str0m::media::Mid, Pending>>> {
+	match step {
+		Step::Waiting(placement) => Ok(Some(placement)),
+		Step::Placed(held) => {
+			deliver(sink, held)?;
+			Ok(None)
+		}
+	}
+}
+
+/// Hand frames to the sink in order, each after the break its line's timeline stepped to it.
+fn deliver(sink: &mut dyn MediaSink, frames: impl IntoIterator<Item = Pending>) -> Result<()> {
+	for Pending { mid, frame, stepped } in frames {
+		if stepped {
+			sink.on_discontinuity(mid)?;
+		}
+		sink.on_frame(mid, frame)?;
+	}
+	Ok(())
 }
 
 /// Log a finished session at the right level, keeping normal WebRTC churn out of the
@@ -1360,6 +1437,54 @@ mod tests {
 		clock.observe(video, sender_info(2, report_time, base + 133_000));
 		// With one track the reports change nothing, and a delta keeps its place.
 		assert_eq!(times(&mut clock, [200, 266, 233]), [100_000, 166_000, 133_000]);
+	}
+
+	/// A clock only the test moves, at [`kio::clock::Manual::WALL_START`].
+	fn manual() -> kio::clock::Installed {
+		kio::clock::Manual::new().install(&tokio::runtime::Handle::current())
+	}
+
+	/// `future`'s output if it is ready without waiting.
+	fn ready<F: std::future::Future>(future: F) -> Option<F::Output> {
+		let mut future = std::pin::pin!(future);
+		match future
+			.as_mut()
+			.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+		{
+			std::task::Poll::Ready(output) => Some(output),
+			std::task::Poll::Pending => None,
+		}
+	}
+
+	/// An ingest publishes its catalog with its first frame, placed at that frame's arrival,
+	/// waiting for no sender report.
+	#[tokio::test]
+	async fn an_ingest_publishes_its_catalog_at_its_first_frame() {
+		let _time = manual();
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+		let mut sink = crate::ingest::IngestSink::new(broadcast, catalog.clone());
+		let placement = ingest_placement(sink.timebase());
+		let audio = str0m::media::MediaKind::Audio;
+		sink.on_track("0".into(), audio, str0m::format::Codec::Opus, Some((48_000, 2)))
+			.unwrap();
+		let mut updates = catalog.consume().unwrap();
+		assert!(ready(updates.next()).is_none(), "withheld until the first frame");
+
+		let arrived = kio::clock::wall();
+		let frame = Pending {
+			mid: "0".into(),
+			frame: codec::Frame {
+				timestamp_us: 0,
+				payload: bytes::Bytes::from_static(&[0xfc, 0xff, 0xfe]),
+			},
+			stepped: false,
+		};
+		let step = take_frame(placement, frame, Instant::now(), true).unwrap();
+		assert!(settle(&mut sink, step).unwrap().is_none(), "placed by the first frame");
+		let published = ready(updates.next()).expect("published with the first frame, no time passing");
+		assert!(published.unwrap().is_some());
+		assert_eq!(catalog.clock().wall_clock(moq_net::Timestamp::ZERO).unwrap(), arrived);
 	}
 
 	fn sender_info(ssrc: u32, ntp_time: SystemTime, rtp_us: u64) -> SenderInfo {

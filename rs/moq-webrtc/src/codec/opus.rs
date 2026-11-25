@@ -13,12 +13,13 @@ impl Bridge {
 	pub fn new(
 		broadcast: moq_net::broadcast::Producer,
 		catalog: moq_mux::catalog::Producer,
+		timebase: moq_mux::catalog::Timebase,
 		sample_rate: u32,
 		channel_count: u32,
 	) -> Result<Self> {
 		let config = moq_mux::codec::opus::Config::new(sample_rate, channel_count);
 		let track = broadcast.unique_track(".opus", catalog.track_info(hang::catalog::PRIORITY.audio));
-		let import = moq_mux::codec::opus::Import::new(track, catalog.reserve(), config.into())?;
+		let import = moq_mux::codec::opus::Import::new(track, timebase.reserve(), config.into())?;
 		Ok(Self { import })
 	}
 }

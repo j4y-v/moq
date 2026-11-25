@@ -306,8 +306,14 @@ mod tests {
 		let catalog =
 			moq_mux::catalog::Producer::new(&mut source.broadcast().clone(), moq_mux::catalog::Config::default())
 				.expect("create catalog");
-		let mut opus = crate::codec::opus::Bridge::new(source.broadcast().clone(), catalog, 48_000, 2)
-			.expect("create Opus bridge");
+		let mut opus = crate::codec::opus::Bridge::new(
+			source.broadcast().clone(),
+			catalog.clone(),
+			catalog.timebase(),
+			48_000,
+			2,
+		)
+		.expect("create Opus bridge");
 		opus.push(Frame {
 			timestamp_us: 20_000,
 			payload: Bytes::from_static(&[0xfc, 0xff, 0xfe]),

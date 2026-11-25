@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- A WebRTC ingest's tracks share one timebase, placed on the catalog clock at the first frame's arrival, so `sync.clock` times its frames; the catalog goes out with that frame. It waits for no RTCP sender report, which a publisher sends for audio only every 5 s.
+
 ## [0.3.12](https://github.com/moq-dev/moq/compare/moq-rtc-v0.3.11...moq-rtc-v0.3.12) - 2026-10-06
 
 ### Other

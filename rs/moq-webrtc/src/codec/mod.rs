@@ -126,7 +126,8 @@ impl DeferredImport for moq_mux::codec::vp9::Import {
 
 struct PendingVideo {
 	track: moq_net::track::Producer,
-	catalog: moq_mux::catalog::Producer,
+	/// The session's shared timebase, which the importer reserves on once it exists.
+	timebase: moq_mux::catalog::Timebase,
 }
 
 enum DeferredState<I> {
@@ -146,11 +147,12 @@ impl<I: DeferredImport> DeferredVideo<I> {
 	pub fn new(
 		broadcast: moq_net::broadcast::Producer,
 		catalog: moq_mux::catalog::Producer,
+		timebase: moq_mux::catalog::Timebase,
 		suffix: &str,
 	) -> Result<Self> {
 		let track = broadcast.unique_track(suffix, catalog.track_info(hang::catalog::PRIORITY.video));
 		Ok(Self {
-			state: DeferredState::Pending(Box::new(PendingVideo { track, catalog })),
+			state: DeferredState::Pending(Box::new(PendingVideo { track, timebase })),
 		})
 	}
 
@@ -163,7 +165,7 @@ impl<I: DeferredImport> DeferredVideo<I> {
 		let DeferredState::Pending(pending) = std::mem::replace(&mut self.state, DeferredState::Poisoned) else {
 			return Err(crate::Error::BridgeFailed);
 		};
-		let reserved = pending.catalog.reserve();
+		let reserved = pending.timebase.reserve();
 		let abort = pending.track.clone();
 		let import = match I::create(pending.track, reserved) {
 			Ok(import) => import,

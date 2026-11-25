@@ -13,8 +13,12 @@ pub struct Bridge {
 
 impl Bridge {
 	/// Publish a `.vp8` track on `broadcast`, adding the catalog rendition once config is known.
-	pub fn new(broadcast: moq_net::broadcast::Producer, catalog: moq_mux::catalog::Producer) -> Result<Self> {
-		let import = codec::DeferredVideo::new(broadcast, catalog, ".vp8")?;
+	pub fn new(
+		broadcast: moq_net::broadcast::Producer,
+		catalog: moq_mux::catalog::Producer,
+		timebase: moq_mux::catalog::Timebase,
+	) -> Result<Self> {
+		let import = codec::DeferredVideo::new(broadcast, catalog, timebase, ".vp8")?;
 		Ok(Self { import })
 	}
 }
@@ -48,7 +52,7 @@ mod tests {
 	fn keyframe_publishes_catalog_dimensions() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
-		let mut bridge = super::Bridge::new(broadcast, catalog.clone()).unwrap();
+		let mut bridge = super::Bridge::new(broadcast, catalog.clone(), catalog.timebase()).unwrap();
 
 		assert!(catalog.snapshot().video.renditions.is_empty());
 

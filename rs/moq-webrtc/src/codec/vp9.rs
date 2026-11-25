@@ -13,8 +13,12 @@ pub struct Bridge {
 
 impl Bridge {
 	/// Publish a `.vp9` track on `broadcast`, adding the catalog rendition once config is known.
-	pub fn new(broadcast: moq_net::broadcast::Producer, catalog: moq_mux::catalog::Producer) -> Result<Self> {
-		let import = codec::DeferredVideo::new(broadcast, catalog, ".vp9")?;
+	pub fn new(
+		broadcast: moq_net::broadcast::Producer,
+		catalog: moq_mux::catalog::Producer,
+		timebase: moq_mux::catalog::Timebase,
+	) -> Result<Self> {
+		let import = codec::DeferredVideo::new(broadcast, catalog, timebase, ".vp9")?;
 		Ok(Self { import })
 	}
 }

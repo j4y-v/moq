@@ -46,7 +46,7 @@ async fn h264_annexb_frame_publishes_catalog_entry() {
 	let mut producer = broadcast.produce();
 	let catalog = moq_mux::catalog::Producer::new(&mut producer, moq_mux::catalog::Config::default()).expect("catalog");
 
-	let mut bridge = codec::h264::Bridge::new(producer, catalog.clone()).expect("bridge");
+	let mut bridge = codec::h264::Bridge::new(producer, catalog.clone(), catalog.timebase()).expect("bridge");
 
 	let codec_frame = Frame {
 		timestamp_us: 0,
@@ -76,7 +76,8 @@ async fn opus_frame_publishes_catalog_entry() {
 	let mut producer = broadcast.produce();
 	let catalog = moq_mux::catalog::Producer::new(&mut producer, moq_mux::catalog::Config::default()).expect("catalog");
 
-	let mut bridge = codec::opus::Bridge::new(producer, catalog.clone(), 48_000, 2).expect("bridge");
+	let mut bridge =
+		codec::opus::Bridge::new(producer, catalog.clone(), catalog.timebase(), 48_000, 2).expect("bridge");
 
 	let payload = Bytes::from_static(&[0xfc, 0xff, 0xfe]); // arbitrary 3-byte Opus packet
 	let codec_frame = Frame {
@@ -100,9 +101,10 @@ async fn idle_video_bridges_do_not_gate_audio_catalog() {
 	let catalog = moq_mux::catalog::Producer::new(&mut producer, moq_mux::catalog::Config::default()).expect("catalog");
 	let mut updates = catalog.consume().expect("catalog consumer");
 
-	let _vp8 = codec::vp8::Bridge::new(producer.clone(), catalog.clone()).expect("vp8 bridge");
-	let _vp9 = codec::vp9::Bridge::new(producer.clone(), catalog.clone()).expect("vp9 bridge");
-	let mut opus = codec::opus::Bridge::new(producer, catalog, 48_000, 2).expect("opus bridge");
+	let _vp8 = codec::vp8::Bridge::new(producer.clone(), catalog.clone(), catalog.timebase()).expect("vp8 bridge");
+	let _vp9 = codec::vp9::Bridge::new(producer.clone(), catalog.clone(), catalog.timebase()).expect("vp9 bridge");
+	let mut opus =
+		codec::opus::Bridge::new(producer, catalog.clone(), catalog.timebase(), 48_000, 2).expect("opus bridge");
 	Bridge::push(
 		&mut opus,
 		Frame {
@@ -127,7 +129,7 @@ async fn vp9_keyframe_publishes_dimensions_and_starts_group() {
 	let mut producer = broadcast.produce();
 	let catalog = moq_mux::catalog::Producer::new(&mut producer, moq_mux::catalog::Config::default()).expect("catalog");
 
-	let mut bridge = codec::vp9::Bridge::new(producer, catalog.clone()).expect("bridge");
+	let mut bridge = codec::vp9::Bridge::new(producer, catalog.clone(), catalog.timebase()).expect("bridge");
 
 	Bridge::push(
 		&mut bridge,
@@ -178,7 +180,8 @@ async fn egress_opus_passthrough() {
 	let broadcast = moq_net::broadcast::Info::new();
 	let mut producer = broadcast.produce();
 	let catalog = moq_mux::catalog::Producer::new(&mut producer, moq_mux::catalog::Config::default()).expect("catalog");
-	let mut bridge = codec::opus::Bridge::new(producer.clone(), catalog.clone(), 48_000, 2).expect("bridge");
+	let mut bridge =
+		codec::opus::Bridge::new(producer.clone(), catalog.clone(), catalog.timebase(), 48_000, 2).expect("bridge");
 
 	let payload = Bytes::from_static(&[0xfc, 0xff, 0xfe]);
 	Bridge::push(
@@ -255,7 +258,7 @@ async fn egress_h264_avc3_passthrough() {
 	let mut producer = broadcast.produce();
 	let catalog = moq_mux::catalog::Producer::new(&mut producer, moq_mux::catalog::Config::default()).expect("catalog");
 
-	let mut bridge = codec::h264::Bridge::new(producer.clone(), catalog.clone()).expect("bridge");
+	let mut bridge = codec::h264::Bridge::new(producer.clone(), catalog.clone(), catalog.timebase()).expect("bridge");
 	Bridge::push(
 		&mut bridge,
 		Frame {

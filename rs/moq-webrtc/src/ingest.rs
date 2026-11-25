@@ -11,6 +11,8 @@ use crate::{Error, Result, codec, session};
 pub struct IngestSink {
 	broadcast: moq_net::broadcast::Producer,
 	catalog: moq_mux::catalog::Producer,
+	/// Every track's timestamp base, so audio and video land on the catalog clock together.
+	timebase: moq_mux::catalog::Timebase,
 	bridges: session::Bridges,
 	/// The route announcing the broadcast, when the sink owns it: held for the session's
 	/// life, linger included, and retracted when the session drops it.
@@ -22,6 +24,7 @@ impl IngestSink {
 	pub fn new(broadcast: moq_net::broadcast::Producer, catalog: moq_mux::catalog::Producer) -> Self {
 		Self {
 			broadcast,
+			timebase: catalog.timebase(),
 			catalog,
 			bridges: session::Bridges::new(),
 			_route: None,
@@ -48,6 +51,10 @@ impl Drop for IngestSink {
 }
 
 impl session::MediaSink for IngestSink {
+	fn timebase(&self) -> moq_mux::catalog::Timebase {
+		self.timebase.clone()
+	}
+
 	fn on_track(
 		&mut self,
 		mid: str0m::media::Mid,
@@ -61,25 +68,36 @@ impl session::MediaSink for IngestSink {
 				Box::new(codec::opus::Bridge::new(
 					self.broadcast.clone(),
 					self.catalog.clone(),
+					self.timebase.clone(),
 					sample_rate,
 					channels,
 				)?)
 			}
-			str0m::format::Codec::H264 => {
-				Box::new(codec::h264::Bridge::new(self.broadcast.clone(), self.catalog.clone())?)
-			}
-			str0m::format::Codec::H265 => {
-				Box::new(codec::h265::Bridge::new(self.broadcast.clone(), self.catalog.clone())?)
-			}
-			str0m::format::Codec::Vp8 => {
-				Box::new(codec::vp8::Bridge::new(self.broadcast.clone(), self.catalog.clone())?)
-			}
-			str0m::format::Codec::Vp9 => {
-				Box::new(codec::vp9::Bridge::new(self.broadcast.clone(), self.catalog.clone())?)
-			}
-			str0m::format::Codec::Av1 => {
-				Box::new(codec::av1::Bridge::new(self.broadcast.clone(), self.catalog.clone())?)
-			}
+			str0m::format::Codec::H264 => Box::new(codec::h264::Bridge::new(
+				self.broadcast.clone(),
+				self.catalog.clone(),
+				self.timebase.clone(),
+			)?),
+			str0m::format::Codec::H265 => Box::new(codec::h265::Bridge::new(
+				self.broadcast.clone(),
+				self.catalog.clone(),
+				self.timebase.clone(),
+			)?),
+			str0m::format::Codec::Vp8 => Box::new(codec::vp8::Bridge::new(
+				self.broadcast.clone(),
+				self.catalog.clone(),
+				self.timebase.clone(),
+			)?),
+			str0m::format::Codec::Vp9 => Box::new(codec::vp9::Bridge::new(
+				self.broadcast.clone(),
+				self.catalog.clone(),
+				self.timebase.clone(),
+			)?),
+			str0m::format::Codec::Av1 => Box::new(codec::av1::Bridge::new(
+				self.broadcast.clone(),
+				self.catalog.clone(),
+				self.timebase.clone(),
+			)?),
 			other => return Err(Error::UnsupportedCodec(format!("{other:?}"))),
 		};
 		self.bridges.insert(mid, bridge);
